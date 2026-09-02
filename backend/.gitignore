@@ -1,0 +1,67 @@
+# ============================================================
+# Segredos e configuração de ambiente — NUNCA versionar
+# ============================================================
+.env
+.env.local
+.env.*.local
+.env.development
+.env.production
+.env.test
+*.pem
+*.key
+jwt-private.pem
+jwt-public.pem
+
+# ============================================================
+# Dependências
+# ============================================================
+node_modules/
+.pnp
+.pnp.js
+.yarn/cache
+.yarn/unplugged
+.yarn/build-state.yml
+.yarn/install-state.gz
+
+# ============================================================
+# Builds e artefatos gerados
+# ============================================================
+dist/
+build/
+out/
+.next/
+.turbo/
+*.tsbuildinfo
+next-env.d.ts
+
+# ============================================================
+# Logs
+# ============================================================
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+logs/
+*.log
+
+# ============================================================
+# Testes / cobertura
+# ============================================================
+coverage/
+.nyc_output/
+
+# ============================================================
+# Editor / OS
+# ============================================================
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
+
+# ============================================================
+# Supabase CLI (se vier a usar `supabase init` localmente)
+# ============================================================
+.supabase/
+supabase/.branches
+supabase/.temp
