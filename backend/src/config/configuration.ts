@@ -30,4 +30,19 @@ export default () => ({
       'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
     ],
   },
+
+  openrouter: {
+    apiKey: process.env.OPENROUTER_API_KEY ?? '',
+    // ⚠️ Confirme o slug exato do modelo em https://openrouter.ai/models
+    // (filtre por "free") antes de usar — o valor abaixo é só um palpite
+    // informado e pode não existir mais no catálogo deles quando você ler isso.
+    model: process.env.OPENROUTER_MODEL ?? 'nvidia/nemotron-nano-9b-v2:free',
+    maxTokens: parseInt(process.env.OPENROUTER_MAX_TOKENS ?? '8000', 10),
+    // Seção 8 da spec: timeout + retry com backoff para chamadas à API de IA.
+    timeoutMs: parseInt(process.env.OPENROUTER_TIMEOUT_MS ?? '120000', 10),
+    maxRetries: parseInt(process.env.OPENROUTER_MAX_RETRIES ?? '2', 10),
+    // Cabeçalhos opcionais recomendados pela OpenRouter para atribuição/analytics.
+    siteUrl: process.env.OPENROUTER_SITE_URL ?? '',
+    siteName: process.env.OPENROUTER_SITE_NAME ?? '',
+  },
 });

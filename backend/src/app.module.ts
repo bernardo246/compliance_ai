@@ -8,6 +8,7 @@ import { JwtAuthGuard } from './common/guards/jwt-auth.guard';
 import { AuthModule } from './auth/auth.module';
 import { UsersModule } from './users/users.module';
 import { DocumentsModule } from './documents/documents.module';
+import { AnalysisModule } from './analysis/analysis.module';
 import { HealthController } from './health.controller';
 
 @Module({
@@ -24,6 +25,7 @@ import { HealthController } from './health.controller';
     AuthModule,
     UsersModule,
     DocumentsModule,
+    AnalysisModule,
   ],
   controllers: [HealthController],
   providers: [

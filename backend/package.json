@@ -5,13 +5,15 @@
   "engines": {
     "node": ">=22.0.0"
   },
-  "description": "Backend NestJS — Plataforma de Análise de Documentos e Dados com IA (Fases 0-3)",
+  "description": "Backend NestJS — Plataforma de Análise de Documentos e Dados com IA (Fases 0-4)",
   "scripts": {
     "build": "nest build",
     "start": "nest start",
     "start:dev": "nest start --watch",
     "start:prod": "node dist/main",
-    "lint": "eslint \"{src,test}/**/*.ts\" --fix"
+    "lint": "eslint \"{src,test}/**/*.ts\" --fix",
+    "golden:build": "ts-node scripts/build-golden-set.ts",
+    "golden:test": "ts-node scripts/test-golden-set.ts"
   },
   "dependencies": {
     "@nestjs/common": "^11.2.3",
@@ -26,12 +28,16 @@
     "class-transformer": "^0.5.1",
     "class-validator": "^0.15.1",
     "cookie-parser": "^1.4.7",
+    "exceljs": "^4.4.0",
     "file-type": "^22.0.2",
     "helmet": "^8.3.0",
+    "papaparse": "^5.7.0",
     "passport": "^0.7.0",
     "passport-jwt": "^4.0.1",
     "reflect-metadata": "^0.2.2",
-    "rxjs": "^7.8.2"
+    "rxjs": "^7.8.2",
+    "unpdf": "^1.8.1",
+    "zod": "^4.5.4"
   },
   "devDependencies": {
     "@nestjs/cli": "^11.0.10",
@@ -40,10 +46,14 @@
     "@types/express": "^5.0.3",
     "@types/multer": "^2.0.0",
     "@types/node": "^22.15.0",
+    "@types/papaparse": "^5.5.2",
     "@types/passport-jwt": "^4.0.1",
+    "dotenv": "^17.4.2",
+    "pdf-lib": "^1.17.1",
+    "ts-node": "^10.9.2",
     "typescript": "^5.7.3"
   },
-  "allowScripts": {
-    "bcrypt@6.0.0": true
+  "overrides": {
+    "uuid": "^11.1.1"
   }
 }

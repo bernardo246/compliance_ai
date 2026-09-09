@@ -1,6 +1,6 @@
 # Plataforma de Análise de Documentos e Dados com IA
 
-Monorepo simples (duas pastas, dois `package.json`) cobrindo as **Fases 0 a 3**
+Monorepo simples (duas pastas, dois `package.json`) cobrindo as **Fases 0 a 4**
 do plano:
 
 - **Fase 0** — Infraestrutura: NestJS + Next.js, config via `.env`, Helmet,
@@ -14,6 +14,13 @@ do plano:
 - **Fase 3** — Upload de documentos: validação de MIME real (magic bytes, não
   a extensão), limite de tamanho, upload para o Supabase Storage, expiração em
   72h, listagem/detalhe/exclusão por usuário.
+- **Fase 4** — Integração com a IA (piloto `juridico`): extração de texto de
+  PDF/CSV/XLSX (`unpdf`, `papaparse`, `exceljs`), template de prompt exaustivo
+  (checklist de compliance, anti-alucinação, schema JSON rígido), chamada à
+  **OpenRouter** (camada gratuita, ex. modelos Nemotron da NVIDIA) com
+  timeout/retry, e validação estrutural da resposta com **Zod** antes de
+  qualquer persistência. Testável isoladamente via `npm run golden:test`
+  (ver seção 5).
 
 O visual do frontend segue à risca o `design-system.md` (paleta escura +
 verde, glassmorphism, grid de fundo, glow, tipografia).
@@ -26,10 +33,15 @@ vulnerabilidades conhecidas na árvore de dependências no momento da entrega.
 
 ```
 projeto-analise-ia/
-├── backend/     # NestJS
+├── backend/
 │   ├── src/
+│   │   ├── auth/          # Fase 1-2
+│   │   ├── documents/     # Fase 3
+│   │   └── analysis/      # Fase 4 — extração, prompt, cliente OpenRouter, schema
+│   ├── scripts/           # geração e teste do golden set (Fase 4)
+│   ├── test-fixtures/     # PDFs de teste com problemas conhecidos injetados
 │   └── sql/001_init.sql   # rodar no SQL editor do Supabase
-└── frontend/    # Next.js 15 (App Router)
+└── frontend/               # Next.js 16 (App Router)
     └── src/
 ```
 
@@ -37,6 +49,7 @@ projeto-analise-ia/
 
 - Node.js 22+ (testado com Node 24)
 - Uma conta/projeto no [Supabase](https://supabase.com) (Postgres + Storage)
+- Uma conta na [OpenRouter](https://openrouter.ai) (para a Fase 4 — análise via IA, usando a camada gratuita)
 - OpenSSL (para gerar o par de chaves RS256) — já vem instalado no macOS/Linux;
   no Windows, use o Git Bash ou o WSL
 
@@ -129,19 +142,36 @@ para o formato real do PEM antes de usar.
 > sim usar o secrets manager do seu provedor de hospedagem (Vercel, Railway,
 > Fly.io, etc. todos têm um). O `.env` é só para desenvolvimento local.
 
-### 2.3. Depois de configurado
+## 3. OpenRouter — passo a passo (Fase 4)
 
-Não precisa fazer mais nada manualmente — o `AuthService` usa
-`JWT_PRIVATE_KEY` para assinar o access token (RS256, expira em 15min por
-padrão) e o `JwtStrategy` usa `JWT_PUBLIC_KEY` para validar cada request.
+A análise via IA usa a **OpenRouter**, um proxy que dá acesso a vários
+modelos (incluindo modelos gratuitos, com rate limit) por uma única API no
+formato "chat completions".
 
-## 3. Backend
+1. Crie uma conta em [openrouter.ai](https://openrouter.ai).
+2. Gere uma chave de API em [openrouter.ai/settings/keys](https://openrouter.ai/settings/keys)
+   — não precisa adicionar crédito se for usar só modelos gratuitos.
+3. Cole a chave em `OPENROUTER_API_KEY` no `.env` do backend.
+4. **Confirme o slug exato do modelo gratuito** em [openrouter.ai/models](https://openrouter.ai/models)
+   (filtre por "free", busque por "nemotron" se quiser um modelo da NVIDIA)
+   e cole em `OPENROUTER_MODEL` — o valor que vem por padrão no
+   `.env.example` é um palpite informado no momento da entrega deste projeto
+   e **pode não existir mais** no catálogo deles quando você for rodar; a
+   disponibilidade de modelos gratuitos muda com frequência.
+5. Modelos gratuitos costumam ter rate limit mais agressivo e podem ser
+   menos consistentes em seguir o formato JSON solicitado do que modelos
+   pagos — se o `golden:test` (seção 5) falhar na validação do schema com
+   frequência, é sinal de que vale trocar de modelo gratuito ou ajustar o
+   prompt para ser ainda mais explícito com aquele modelo específico.
+
+## 4. Backend
 
 ```bash
 cd backend
 npm install
 cp .env.example .env
-# preencha SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY e as chaves JWT (passos 1 e 2 acima)
+# preencha SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, as chaves JWT (seções 1 e 2)
+# e OPENROUTER_API_KEY + OPENROUTER_MODEL (seção 3)
 
 npm run start:dev
 # API em http://localhost:3001
@@ -153,7 +183,34 @@ Teste rápido:
 curl http://localhost:3001/api/health
 ```
 
-## 4. Frontend
+## 5. Testando a Fase 4 isoladamente (golden set)
+
+A integração com a IA pode ser testada sem precisar do frontend nem do fluxo
+de upload completo — é assim que a Fase 4 foi validada durante o
+desenvolvimento:
+
+```bash
+cd backend
+
+# 1. Gera dois PDFs de teste em test-fixtures/: um contrato com 7 problemas
+#    de compliance injetados de propósito, e um contrato bem estruturado.
+npm run golden:build
+
+# 2. Roda a análise de verdade contra os dois PDFs (usa sua OPENROUTER_API_KEY)
+#    e confere quantos dos problemas conhecidos o modelo capturou.
+npm run golden:test
+```
+
+O script imprime o `resumo_executivo`, o checklist completo item a item, e ao
+final uma conferência automática de quantos dos problemas conhecidos
+(ausência de CPF, reajuste sem índice, multa desproporcional, confidencialidade
+sem prazo, ausência de assinatura/testemunhas) o modelo realmente encontrou.
+
+Se algum problema esperado não for capturado consistentemente, é sinal de que
+o prompt (`backend/src/analysis/prompts/juridico.prompt.ts`) precisa de ajuste
+— é exatamente para isso que serve o golden set.
+
+## 6. Frontend
 
 ```bash
 cd frontend
@@ -163,8 +220,7 @@ npm run dev
 # App em http://localhost:3000
 ```
 
-
-## Fluxo esperado
+## Fluxo esperado (Fases 0-3, via frontend)
 
 1. `/register` → cria conta → redireciona para `/termos`.
 2. `/termos` → aceite obrigatório → redireciona para `/upload`.
@@ -174,15 +230,25 @@ npm run dev
 Sem aceitar o termo, `/api/documents/*` responde `403 Forbidden`
 (`TermsAcceptedGuard`) mesmo com um access token válido.
 
-## O que fica para as próximas fases (não incluído aqui)
+A Fase 4 (análise via IA) ainda **não está conectada** a esse fluxo do
+frontend/upload — ela existe como uma função isolada e testável
+(`AnalysisService.analyze()`), testada via `npm run golden:test`. Ligar as
+duas pontas (upload → fila → análise → status `done` → resultado na tela) é
+o escopo da Fase 5 e da Fase 6.
 
-- **Fase 4** — Extração de conteúdo (parsing de PDF/CSV/XLSX).
-- **Fase 5** — Pipeline de análise via Claude API + fila/worker assíncrono,
-  preenchendo a tabela `analyses` (já criada na migração).
+## O que fica para as próximas fases
+
+- **Fase 5** — Pipeline assíncrono: fila/worker que dispara a análise após o
+  upload sem travar a requisição HTTP, persistindo o resultado em `analyses`
+  e atualizando `documents.status` (`uploaded` → `processing` → `done`/`error`).
 - **Fase 6** — Telas de status/polling e resultado (resumo executivo,
   compliance, sugestões) no frontend.
-- **Fase 7/8** — Relatórios exportáveis, hardening (antivírus no upload, testes
-  automatizados, observabilidade).
+- **Fase 7** — Job agendado de retenção de 72h (deleção automática do arquivo
+  original do Storage).
+- **Fase 8** — Hardening de segurança (scan antivírus no upload, revisão
+  completa do checklist de segurança).
+- **Fase 9** — Templates de prompt para as demais áreas (`financas`,
+  `imobiliario`, `rh`, `saude`, `outro`) — hoje só `juridico` está implementado.
 
 ## Notas de segurança já aplicadas
 
@@ -194,3 +260,9 @@ Sem aceitar o termo, `/api/documents/*` responde `403 Forbidden`
 - Upload valida o tipo real do arquivo pelos magic bytes, não pela extensão.
 - RLS habilitado em todas as tabelas (defesa em profundidade, mesmo o backend
   usando a `service_role` key).
+- Resposta da IA nunca é confiada "cegamente" — sempre validada
+  estruturalmente (schema Zod) antes de qualquer uso; JSON malformado ou fora
+  do schema gera um erro claro (`InvalidAnalysisResponseError`) em vez de
+  seguir adiante com dado ruim.
+- Chamada à API de IA com timeout configurável e retry com backoff
+  exponencial (não trava indefinidamente, não esgota tentativas em rajada).
