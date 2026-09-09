@@ -4,8 +4,8 @@ import { ConfigService } from '@nestjs/config';
 const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
 
 interface ChatCompletionResponse {
-  choices?: Array<{ message?: { content?: string } }>;
-  error?: { message?: string };
+  choices?: Array<{ message?: { content?: string }; finish_reason?: string }>;
+  error?: { message?: string; code?: number };
 }
 
 /**
@@ -75,19 +75,39 @@ export class OpenRouterClient {
 
         const data = (await res.json().catch(() => null)) as ChatCompletionResponse | null;
 
-        if (!res.ok) {
-          const message = data?.error?.message ?? `HTTP ${res.status}`;
+        // A OpenRouter às vezes devolve HTTP 200 com o erro no corpo (ex.: falha
+        // do provider upstream por trás do modelo). O status HTTP a considerar
+        // nesse caso é o `error.code` do corpo, não o `res.status`.
+        const errorInBody = data?.error;
+        const effectiveStatus = errorInBody?.code ?? res.status;
+
+        if (!res.ok || errorInBody) {
+          const message = errorInBody?.message ?? `HTTP ${res.status}`;
           // Erros 4xx (exceto 429) não se beneficiam de retry — a requisição
           // em si está errada (chave inválida, modelo inexistente, etc.).
-          if (res.status < 500 && res.status !== 429) {
+          if (effectiveStatus < 500 && effectiveStatus !== 429) {
             throw new Error(`OpenRouter recusou a requisição: ${message}`);
           }
-          throw new Error(`OpenRouter indisponível (${res.status}): ${message}`);
+          throw new Error(`OpenRouter indisponível (${effectiveStatus}): ${message}`);
         }
 
         const content = data?.choices?.[0]?.message?.content;
         if (!content) {
+          // Log da resposta bruta pra diagnóstico: provider que ignora
+          // response_format, resposta só com reasoning tokens, etc.
+          this.logger.warn(
+            `Resposta sem content. Corpo bruto: ${JSON.stringify(data).slice(0, 1500)}`,
+          );
           throw new Error('Resposta da OpenRouter sem conteúdo de mensagem.');
+        }
+
+        // `length` = a resposta foi truncada pelo max_tokens e o JSON vai vir
+        // incompleto. Não adianta tentar de novo (seria idêntico) — avisa alto
+        // pra quem estiver rodando aumentar OPENROUTER_MAX_TOKENS.
+        if (data?.choices?.[0]?.finish_reason === 'length') {
+          this.logger.warn(
+            'A IA truncou a resposta (finish_reason=length). Aumente OPENROUTER_MAX_TOKENS.',
+          );
         }
 
         return content;

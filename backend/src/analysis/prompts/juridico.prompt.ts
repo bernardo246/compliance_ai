@@ -82,6 +82,7 @@ Para cada item do checklist acima, gere uma entrada com:
 - "dados_faltantes": lista (array de strings) de informações que deveriam estar no documento mas não foram encontradas (ex.: "CPF de uma das partes não informado").
 - "sugestoes_melhoria": lista (array de strings) de sugestões práticas de melhoria do documento como um todo, além das sugestões pontuais já dadas por item do checklist. Este campo é OBRIGATÓRIO — mesmo que o documento esteja bom, sugira pelo menos boas práticas de reforço (nunca deixe este array vazio sem justificativa).
 - "aviso_legal": copie EXATAMENTE este texto, sem alterações: "${AVISO_LEGAL_PADRAO}"
+-"OBS: elemento obrigatório ausente = nao_conforme; use nao_verificavel só quando o documento estiver ilegível/truncado."
 
 # SCHEMA JSON ESPERADO (responda exatamente neste formato)
 

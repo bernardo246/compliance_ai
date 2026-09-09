@@ -59,12 +59,8 @@ export class AnalysisService {
    * (seção 8 da spec).
    */
   private parseAndValidate(rawResponse: string): AnalysisResult {
-    const cleaned = this.stripMarkdownFences(rawResponse);
-
-    let parsedJson: unknown;
-    try {
-      parsedJson = JSON.parse(cleaned);
-    } catch {
+    const parsedJson = this.parseJsonLoose(rawResponse);
+    if (parsedJson === undefined) {
       throw new InvalidAnalysisResponseError(
         'A resposta da IA não é um JSON válido.',
         rawResponse,
@@ -85,9 +81,52 @@ export class AnalysisService {
     return result.data;
   }
 
-  private stripMarkdownFences(text: string): string {
-    const trimmed = text.trim();
-    const fenceMatch = /^```(?:json)?\s*([\s\S]*?)\s*```$/i.exec(trimmed);
-    return fenceMatch ? fenceMatch[1] : trimmed;
+  /**
+   * Tenta extrair um objeto JSON da resposta do modelo, tolerando os defeitos
+   * mais comuns de modelos grátis: cercas de markdown, texto solto antes/depois
+   * do objeto, e a chave de abertura duplicada (`{{`) que alguns providers da
+   * OpenRouter injetam quando `response_format: json_object` está ligado.
+   *
+   * Gera candidatos e devolve o primeiro que `JSON.parse` aceitar — nunca
+   * "conserta" o JSON às cegas, só tenta recortes plausíveis. Retorna
+   * `undefined` se nenhum candidato for válido.
+   */
+  private parseJsonLoose(raw: string): unknown {
+    let text = raw.trim();
+
+    const fence = /^```(?:json)?\s*([\s\S]*?)\s*```$/i.exec(text);
+    if (fence) text = fence[1].trim();
+
+    const candidates = new Set<string>();
+    candidates.add(text);
+
+    // Texto solto fora do objeto: recorta do primeiro "{" ao último "}".
+    const first = text.indexOf('{');
+    const last = text.lastIndexOf('}');
+    if (first !== -1 && last > first) {
+      candidates.add(text.slice(first, last + 1));
+
+      // Chave de abertura duplicada ("{\n{ \"resumo\"...") — alguns providers
+      // da OpenRouter injetam um "{" e o modelo escreve outro em seguida.
+      // Recorta a partir da SEGUNDA chave (não colapsa a do fim às cegas,
+      // porque "...}}" costuma ser um objeto aninhado legítimo no final).
+      if (/^\{\s*\{/.test(text)) {
+        const second = text.indexOf('{', first + 1);
+        candidates.add(text.slice(second, last + 1));
+        // Se a duplicação for simétrica ("{{ ... }}"), recorta as duas pontas.
+        if (/\}\s*\}\s*$/.test(text)) {
+          candidates.add(text.slice(second, text.lastIndexOf('}', last - 1) + 1));
+        }
+      }
+    }
+
+    for (const candidate of candidates) {
+      try {
+        return JSON.parse(candidate);
+      } catch {
+        // tenta o próximo candidato
+      }
+    }
+    return undefined;
   }
 }
