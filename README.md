@@ -261,10 +261,27 @@ Ao final imprime a linha de `analyses` gravada e **limpa tudo que criou**
   `documents.user_id`). `GET /api/documents/:id` passa a incluir `analise`
   (ou `null`) — o frontend consulta status + resultado numa chamada só.
 
-Limitação assumida (a spec permite "background simples" no lugar de BullMQ +
-Redis): a fila vive no processo. Uma instância única do backend está coberta
-pela recuperação no boot; para múltiplas instâncias / worker separado, trocar
-`AnalysisRunnerService` por BullMQ é uma mudança localizada.
+**Decisão de arquitetura — fila in-process vs. BullMQ + Redis**
+
+A spec permite as duas (*"BullMQ/Redis **ou** processamento em background
+simples"*). Optou-se pela fila in-process. Comparação:
+
+| Aspecto | In-process (implementado) | BullMQ + Redis |
+|---|---|---|
+| Serviços a rodar | 1 (o backend) | 3 (backend + Redis + worker opcionalmente separado) |
+| Sobrevive a restart/crash? | Não — a fila em RAM some. Mitigado pelo `recoverPending()` no boot, que varre o banco e reenfileira `uploaded`/`processing` presos | Sim — o job fica no Redis e é retomado |
+| Escala horizontal (2+ instâncias do backend) | Quebra — cada instância teria sua própria fila; dois `recoverPending()` competiriam pelo mesmo documento (o `unique(document_id)` evita linha duplicada, mas desperdiça chamadas à IA) | Funciona — fila compartilhada no Redis, cada job vai para um worker só |
+| Worker isolado do servidor HTTP | Não — a análise (dezenas de segundos) roda no mesmo processo que atende requisições | Sim — processo `worker` dedicado, escalável à parte |
+| Retry / backoff | Manual (já existe no `openrouter.client.ts`) | Nativo, configurável por job |
+| Jobs agendados (ex.: Fase 7 — limpeza de 72h) | Precisa de `@nestjs/schedule`/cron à parte | Embutido (delayed / repeat jobs) |
+| Observabilidade da fila | Logs | Dashboard visual (Bull Board) |
+| Custo / complexidade | Zero | Redis para manter, monitorar e pagar |
+
+Gatilho para migrar: **precisar de mais de uma instância do backend**, ou
+querer isolar o worker do servidor HTTP. Enquanto for uma instância só (deploy
+típico de MVP), a fila in-process entrega o mesmo resultado funcional. A
+migração é localizada — `enqueue()` vira `queue.add()`, o loop vira
+`new Worker()` — sem tocar em `DocumentsService`, controllers ou schema.
 
 ## 6. Frontend
 
@@ -276,7 +293,7 @@ npm run dev
 # App em http://localhost:3000
 ```
 
-## Fluxo esperado (Fases 0-3, via frontend)
+## Fluxo esperado (via frontend)
 
 1. `/register` → cria conta → redireciona para `/termos`.
 2. `/termos` → aceite obrigatório → redireciona para `/upload`.
@@ -291,6 +308,192 @@ entra como `uploaded` e o worker in-process move para `processing` e depois
 `done`/`error`. O que ainda falta é o **frontend** de status/polling e de
 resultado — hoje o `/upload` só mostra o rótulo de status, sem tela de
 resultado. Isso é a Fase 6.
+
+## Arquitetura por fase — o que foi feito e como escala
+
+Cada fase abaixo traz: **o que faz**, **o que foi implementado** e uma análise
+de **escala horizontal** (rodar N instâncias do backend atrás de um load
+balancer). O que faz um serviço quebrar ao escalar é *estado guardado na
+memória do processo*; estado no Postgres/Storage (compartilhado) ou calculado
+por requisição escala liso.
+
+### Resumo
+
+| Fase | Escala horizontal hoje? | O que falta para escalar |
+|---|---|---|
+| 0 — Infra | ⚠️ Quase | Rate limiter (`@nestjs/throttler`) usa contadores em RAM → mover para Redis |
+| 1 — Auth | ✅ Sim | Nada (só as chaves RS256 idênticas em todas as instâncias) |
+| 2 — Autorização / Termo | ✅ Sim | Nada |
+| 3 — Upload | ✅ Sim | Nada (atenção operacional: Multer bufferiza em RAM) |
+| 4 — IA (função isolada) | ✅ Sim | Nada no código (cuidado com o rate limit externo da OpenRouter) |
+| 5 — Pipeline assíncrono | ❌ Não | Fila in-process → BullMQ + Redis |
+
+**Conclusão:** adicionar **um único Redis** resolve a Fase 0 (rate limit
+distribuído) e a Fase 5 (fila durável e compartilhada) de uma vez.
+
+---
+
+### Fase 0 — Fundamentos e Infraestrutura
+
+**O que faz:** deixa o esqueleto rodando, sem lógica de negócio.
+
+**Implementado:** projeto NestJS (backend) + Next.js 16 App Router (frontend);
+`ConfigModule` carregando `.env` via `configuration.ts`; `helmet`, CORS restrito
+ao `FRONTEND_URL`, `ValidationPipe` global (whitelist + forbidNonWhitelisted);
+`ThrottlerModule` (rate limit); `HttpExceptionFilter` global; health-check
+`GET /api/health`; `SupabaseService` (client único com a `service_role` key,
+`@Global`).
+
+| Componente | Onde vive o estado | Escala? |
+|---|---|---|
+| Config (`.env` / `ConfigModule`) | Lido no boot, imutável | ✅ (mesmo `.env` em todas as instâncias) |
+| Helmet / CORS / ValidationPipe | Stateless, por requisição | ✅ |
+| Health-check | Stateless | ✅ |
+| `SupabaseService` | Client HTTP, sem estado local; fala com Postgres/Storage compartilhados | ✅ |
+| **`ThrottlerModule` (rate limit)** | **Contadores em memória** (`ThrottlerModule.forRoot` sem storage) | ⚠️ Com N instâncias o limite efetivo vira `N × 30/min`; não quebra, mas afrouxa e um atacante que caia em instâncias diferentes contorna parte do limite |
+
+**Para escalar:** trocar o storage do throttler por um compartilhado
+(`@nest-lab/throttler-storage-redis`). É o mesmo Redis que a Fase 5 vai querer.
+
+---
+
+### Fase 1 — Autenticação
+
+**O que faz:** cadastro, login e emissão/renovação de JWT ponta a ponta.
+
+**Implementado:** `POST /api/auth/register | login | refresh | logout`. Senha
+com **bcrypt** (custo 12), nunca logada. **Access token** JWT **RS256**, 15 min,
+validado com a chave pública. **Refresh token** opaco (aleatório), guardado como
+**hash SHA-256** em `refresh_tokens`, **rotacionado a cada uso**, entregue em
+cookie `httpOnly` (7 dias). **Detecção de reuso:** se um refresh token já
+rotacionado reaparece, toda a cadeia daquele usuário é revogada.
+
+| Componente | Onde vive o estado | Escala? |
+|---|---|---|
+| Validação do access token (`JwtStrategy`) | Stateless — só verifica a assinatura com a chave pública | ✅ |
+| Emissão do access token | Precisa da chave privada (no `.env`) | ✅ |
+| bcrypt (hash / compare) | CPU pura, sem estado | ✅ |
+| Refresh token (rotação / revogação / reuso) | Postgres (`refresh_tokens`) | ✅ |
+
+**Para escalar:** nada. Auth é stateless (JWT) ou lastreada no banco. Única
+exigência: **as chaves RS256 idênticas em todas as instâncias** — em produção,
+via secrets manager do provedor, não `.env` copiado à mão.
+
+---
+
+### Fase 2 — Autorização e Termo de Uso
+
+**O que faz:** RBAC + bloqueio de upload/análise enquanto o Termo de Uso vigente
+não for aceito.
+
+**Implementado:** roles `user` / `admin` (`@Roles()` + `RolesGuard`).
+`TermsAcceptedGuard` protege `/api/documents/*` e `/api/analyses/*`: consulta
+`users.terms_accepted` + `users.terms_version` **no banco a cada request**
+(o aceite pode ocorrer depois de o token já ter sido emitido). `POST
+/api/auth/accept-terms` grava versão + timestamp. Sem aceite, resposta é
+`403 Forbidden` mesmo com access token válido.
+
+| Componente | Onde vive o estado | Escala? |
+|---|---|---|
+| `RolesGuard` | Role vem do payload do JWT | ✅ |
+| `TermsAcceptedGuard` | Postgres (`users`) — 1 query por request nas rotas protegidas | ✅ |
+| Versão vigente do termo | Env `TERMS_CURRENT_VERSION` | ✅ (igual em todas as instâncias) |
+
+**Para escalar:** nada. Opcional, se a query por request incomodar sob carga
+alta: cache curto do `terms_accepted` por usuário (Redis, TTL de segundos).
+Não é gargalo real hoje.
+
+---
+
+### Fase 3 — Upload de Documentos
+
+**O que faz:** recebe o arquivo + `area_negocio`, valida, guarda no Storage e
+registra no banco com expiração de 72h.
+
+**Implementado:** `POST /api/documents` (multipart). **Validação de MIME real
+por magic bytes** (`file-type`), não pela extensão; CSV puro cai num fallback
+"parece texto". Limite de 20MB (hard cap no interceptor + checagem fina no
+service). Upload para o **Supabase Storage** (bucket privado) em
+`{userId}/{docId}-{nome}`. `documents` gravado com `expira_em = now + 72h`.
+`GET /api/documents`, `GET /api/documents/:id`, `DELETE /api/documents/:id`
+(remove do Storage best-effort + marca `deletado_em`). Todas as queries
+filtram por dono.
+
+| Componente | Onde vive o estado | Escala? |
+|---|---|---|
+| Validação de magic bytes | Buffer em memória, por request, efêmero | ✅ |
+| Multer (`FileInterceptor`, `memoryStorage`) | Arquivo em RAM durante o request | ✅ (pressão de memória por instância, não é bug de correção) |
+| Upload / download | Supabase Storage (externo, compartilhado) | ✅ |
+| Registro / listagem / exclusão | Postgres (`documents`) | ✅ |
+
+**Para escalar:** nada no código. Atenção operacional: muitos uploads grandes
+simultâneos consomem RAM da instância (Multer bufferiza em memória) — sob
+volume alto, migrar para streaming direto ao Storage ou `diskStorage`.
+
+---
+
+### Fase 4 — Integração com a IA (template piloto `juridico`)
+
+**O que faz:** dado um documento (buffer + tipo + área), devolve uma análise de
+compliance validada estruturalmente. Função pura, sem banco — testável isolada.
+
+**Implementado:** `AnalysisService.analyze()`. Extração de texto (PDF via
+`unpdf`, CSV via `papaparse`, XLSX via `exceljs`). `getPromptTemplate(area)`
+escolhe o system prompt (só `juridico` hoje; checklist exaustivo de 23 itens,
+referencial normativo, anti-alucinação, schema JSON rígido). `OpenRouterClient`
+chama a **OpenRouter** (formato chat-completions) com timeout, retry + backoff
+exponencial e tratamento de erro que vem no corpo com HTTP 200. A resposta passa
+por `parseJsonLoose` (tolera cerca markdown, `{{` duplicado, texto solto) e por
+**validação Zod** (`AnalysisResultSchema`) — resposta fora do schema vira
+`InvalidAnalysisResponseError`, **nunca é persistida**. Validada pelo golden set
+(`npm run golden:build` + `golden:test`, seção 5).
+
+| Componente | Onde vive o estado | Escala? |
+|---|---|---|
+| Extração de texto | CPU / memória por request, efêmero | ✅ |
+| Seleção de template | Constante em código | ✅ |
+| `OpenRouterClient` | Chamada HTTP sem estado local (o retry vive dentro da própria chamada) | ✅ |
+| Validação Zod | Pura | ✅ |
+
+**Para escalar:** nada — `analyze()` não tem estado nem banco. O limite real é
+**externo**: o rate limit da OpenRouter (agressivo na camada grátis). Com N
+instâncias chamando em paralelo é mais fácil bater no `429` — mitigado pelo
+`ANALYSIS_CONCURRENCY` (Fase 5) e, idealmente, por um rate limiter compartilhado
+(Redis) ou uma chave paga.
+
+---
+
+### Fase 5 — Pipeline Assíncrono e Persistência
+
+**O que faz:** conecta upload → análise → resultado salvo, sem travar a resposta
+HTTP do upload.
+
+**Implementado:** `DocumentsService.upload()` chama
+`analysisRunner.enqueue(id)` **sem `await`** (resposta volta na hora com
+`status: uploaded`). `AnalysisRunnerService` — fila em memória, concorrência
+`ANALYSIS_CONCURRENCY` — para cada job: `status: processing` → baixa do Storage
+→ `analyze()` → **upsert** em `analyses` (`unique(document_id)`, idempotente) →
+`status: done`; qualquer erro → `status: error` + `documents.erro`. No boot,
+`recoverPending()` reenfileira documentos presos em `uploaded` ou `processing`
+antigo. `GET /api/analyses/:id` (checagem de dono via join). `GET
+/api/documents/:id` passa a embutir `analise`.
+
+| Componente | Onde vive o estado | Escala? |
+|---|---|---|
+| **Fila de jobs** | **Array na RAM do processo** | ❌ Cada instância teria a sua, sem coordenação |
+| `recoverPending()` no boot | Lê do Postgres | ⚠️ N instâncias competiriam pelo mesmo documento; o `unique(document_id)` evita linha duplicada, mas duas instâncias gastariam a chamada à IA |
+| Persistência do resultado | Postgres (`analyses`, upsert idempotente) | ✅ |
+| Status do documento | Postgres (`documents`) | ✅ |
+| Leitura (`GET /api/analyses/:id`) | Postgres | ✅ |
+
+**Para escalar:** **é a única fase que quebra de fato.** Trocar o
+`AnalysisRunnerService` por **BullMQ + Redis** — fila compartilhada e durável,
+worker isolável do servidor HTTP. A migração é localizada (`enqueue()` vira
+`queue.add()`, o loop vira `new Worker()`), sem tocar em `DocumentsService`,
+controllers ou schema. Comparação completa e gatilho de migração na
+**seção 5.1**.
+
+---
 
 ## O que fica para as próximas fases
 
