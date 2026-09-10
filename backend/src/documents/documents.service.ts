@@ -5,6 +5,8 @@ import {
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { randomUUID } from 'crypto';
+import { AnalysisReadService } from '../analysis/analysis-read.service';
+import { AnalysisRunnerService } from '../analysis/analysis-runner.service';
 import { SupabaseService } from '../common/supabase/supabase.service';
 import { AreaNegocio } from './dto/upload-document.dto';
 import { MIME_TO_TIPO } from './documents.types';
@@ -16,6 +18,8 @@ export class DocumentsService {
   constructor(
     private readonly supabase: SupabaseService,
     private readonly config: ConfigService,
+    private readonly analysisRunner: AnalysisRunnerService,
+    private readonly analysisRead: AnalysisReadService,
   ) {}
 
   private db() {
@@ -125,6 +129,13 @@ export class DocumentsService {
     }
 
     await this.logAudit(userId, 'upload');
+
+    // Fase 5 — dispara a análise em background. Fire-and-forget de propósito:
+    // a resposta do upload não espera a IA (que leva segundos a minutos).
+    // O status do documento (uploaded → processing → done/error) é a fonte
+    // de verdade do progresso.
+    this.analysisRunner.enqueue(document.id);
+
     return document;
   }
 
@@ -152,7 +163,11 @@ export class DocumentsService {
     if (error || !data) {
       throw new NotFoundException('Documento não encontrado.');
     }
-    return data;
+
+    // Fase 5: embute a análise (ou null) para o frontend consultar status +
+    // resultado numa chamada só, sem precisar de um segundo GET.
+    const analise = await this.analysisRead.findByDocument(documentId);
+    return { ...data, analise };
   }
 
   async deleteForUser(userId: string, documentId: string) {

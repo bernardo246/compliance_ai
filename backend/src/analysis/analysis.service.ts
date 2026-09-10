@@ -16,6 +16,17 @@ export class InvalidAnalysisResponseError extends Error {
   }
 }
 
+export interface AnalysisOutcome {
+  /** Resultado já validado contra o schema Zod. */
+  result: AnalysisResult;
+  /** Metadados da chamada à IA, para persistir em `analyses` (auditoria/custo). */
+  modelo: string;
+  tokensUsados: number | null;
+  templateVersao: string;
+  /** Texto cru devolvido pelo modelo, para depuração posterior. */
+  rawResponse: string;
+}
+
 @Injectable()
 export class AnalysisService {
   private readonly logger = new Logger(AnalysisService.name);
@@ -39,7 +50,7 @@ export class AnalysisService {
     buffer: Buffer,
     tipo: TipoDocumento,
     areaNegocio: AreaNegocio,
-  ): Promise<AnalysisResult> {
+  ): Promise<AnalysisOutcome> {
     const template = getPromptTemplate(areaNegocio);
     const content = await this.extraction.extractText(buffer, tipo);
 
@@ -47,8 +58,14 @@ export class AnalysisService {
       `Analisando documento tipo=${tipo} area=${areaNegocio} template_versao=${template.versao} (${content.length} caracteres extraídos)`,
     );
 
-    const rawResponse = await this.openRouter.chatJson(template.systemPrompt, content);
-    return this.parseAndValidate(rawResponse);
+    const response = await this.openRouter.chatJson(template.systemPrompt, content);
+    return {
+      result: this.parseAndValidate(response.content),
+      modelo: response.model,
+      tokensUsados: response.tokensUsed,
+      templateVersao: template.versao,
+      rawResponse: response.content,
+    };
   }
 
   /**

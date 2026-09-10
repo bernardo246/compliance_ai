@@ -1,6 +1,6 @@
 # Plataforma de Análise de Documentos e Dados com IA
 
-Monorepo simples (duas pastas, dois `package.json`) cobrindo as **Fases 0 a 4**
+Monorepo simples (duas pastas, dois `package.json`) cobrindo as **Fases 0 a 5**
 do plano:
 
 - **Fase 0** — Infraestrutura: NestJS + Next.js, config via `.env`, Helmet,
@@ -21,6 +21,11 @@ do plano:
   timeout/retry, e validação estrutural da resposta com **Zod** antes de
   qualquer persistência. Testável isoladamente via `npm run golden:test`
   (ver seção 5).
+- **Fase 5** — Pipeline assíncrono: o upload enfileira a análise e responde na
+  hora; um worker in-process (sem Redis) baixa o arquivo do Storage, chama a
+  IA, grava em `analyses` e move `documents.status` `uploaded` → `processing`
+  → `done`/`error`. Endpoint `GET /api/analyses/:id`. Testável ponta a ponta
+  via `npm run pipeline:test` (ver seção 5.1).
 
 O visual do frontend segue à risca o `design-system.md` (paleta escura +
 verde, glassmorphism, grid de fundo, glow, tipografia).
@@ -37,10 +42,10 @@ projeto-analise-ia/
 │   ├── src/
 │   │   ├── auth/          # Fase 1-2
 │   │   ├── documents/     # Fase 3
-│   │   └── analysis/      # Fase 4 — extração, prompt, cliente OpenRouter, schema
-│   ├── scripts/           # geração e teste do golden set (Fase 4)
+│   │   └── analysis/      # Fase 4-5 — extração, prompt, OpenRouter, schema, runner
+│   ├── scripts/           # golden set (Fase 4) + teste de pipeline (Fase 5)
 │   ├── test-fixtures/     # PDFs de teste com problemas conhecidos injetados
-│   └── sql/001_init.sql   # rodar no SQL editor do Supabase
+│   └── sql/               # 001_init.sql + 002_analysis_pipeline.sql (rodar no Supabase, em ordem)
 └── frontend/               # Next.js 16 (App Router)
     └── src/
 ```
@@ -64,7 +69,7 @@ projeto-analise-ia/
    raiz do Postgres) e escolha a região mais próxima de você.
 4. Aguarde 1-2 minutos até o projeto ficar pronto (status "Active").
 
-### 1.2. Rodar a migration (criar as tabelas)
+### 1.2. Rodar as migrations (criar as tabelas)
 
 1. No painel do projeto, vá em **SQL Editor** (ícone de terminal na sidebar).
 2. Clique em **New query**.
@@ -73,6 +78,11 @@ projeto-analise-ia/
 4. Clique em **Run** (ou `Ctrl+Enter`).
 5. Confirme em **Table Editor** que as tabelas apareceram: `users`,
    `refresh_tokens`, `documents`, `analyses`, `audit_logs`.
+6. Repita os passos 2-4 com `backend/sql/002_analysis_pipeline.sql` (colunas da
+   Fase 5: `analyses.checklist`, `analyses.status_compliance_geral`,
+   `documents.processing_started_at`, `documents.erro`, etc.). Rodar **depois**
+   da 001. Ambas são idempotentes (`if not exists`), então rodar de novo não
+   quebra nada.
 
 ### 1.3. Criar o bucket de Storage
 
@@ -210,6 +220,52 @@ Se algum problema esperado não for capturado consistentemente, é sinal de que
 o prompt (`backend/src/analysis/prompts/juridico.prompt.ts`) precisa de ajuste
 — é exatamente para isso que serve o golden set.
 
+### 5.1. Testando o pipeline assíncrono (Fase 5)
+
+Exercita o caminho completo **upload → fila → worker → `analyses` → status
+`done`**, sem passar pelo HTTP/login. Requer a migração `002` aplicada e
+`npm run golden:build` já rodado.
+
+```bash
+cd backend
+npm run pipeline:test
+```
+
+O script cria um documento de teste, sobe o PDF para o Storage, chama
+`AnalysisRunnerService.enqueue()` (o mesmo que o upload faz) e faz polling em
+`documents.status`, imprimindo as transições:
+
+```
+  [0s]  status: processing
+  [48s] status: done
+Transições observadas: processing → done
+✅ Critério de pronto da Fase 5 atendido (uploaded → processing → done, resultado consultável).
+```
+
+Ao final imprime a linha de `analyses` gravada e **limpa tudo que criou**
+(documento, análise, objeto no Storage, usuário de teste).
+
+**Como funciona no backend:**
+
+- `DocumentsService.upload()` chama `analysisRunner.enqueue(id)` **sem `await`**
+  — a resposta do upload volta na hora com `status: 'uploaded'`.
+- `AnalysisRunnerService` (`src/analysis/analysis-runner.service.ts`) tem uma
+  fila em memória com concorrência `ANALYSIS_CONCURRENCY` (default 2). Cada job:
+  baixa o arquivo do Storage → `AnalysisService.analyze()` → `upsert` em
+  `analyses` (idempotente, `unique(document_id)`) → `status = 'done'`. Qualquer
+  erro no caminho vira `status = 'error'` + `documents.erro` com a mensagem.
+- No boot, `recoverPending()` reenfileira documentos que ficaram em `uploaded`
+  (enqueue perdido num restart) ou `processing` há mais de
+  `ANALYSIS_STUCK_TIMEOUT_MS` (processo caiu no meio de uma análise).
+- `GET /api/analyses/:id` devolve o resultado (checagem de dono via join com
+  `documents.user_id`). `GET /api/documents/:id` passa a incluir `analise`
+  (ou `null`) — o frontend consulta status + resultado numa chamada só.
+
+Limitação assumida (a spec permite "background simples" no lugar de BullMQ +
+Redis): a fila vive no processo. Uma instância única do backend está coberta
+pela recuperação no boot; para múltiplas instâncias / worker separado, trocar
+`AnalysisRunnerService` por BullMQ é uma mudança localizada.
+
 ## 6. Frontend
 
 ```bash
@@ -230,17 +286,14 @@ npm run dev
 Sem aceitar o termo, `/api/documents/*` responde `403 Forbidden`
 (`TermsAcceptedGuard`) mesmo com um access token válido.
 
-A Fase 4 (análise via IA) ainda **não está conectada** a esse fluxo do
-frontend/upload — ela existe como uma função isolada e testável
-(`AnalysisService.analyze()`), testada via `npm run golden:test`. Ligar as
-duas pontas (upload → fila → análise → status `done` → resultado na tela) é
-o escopo da Fase 5 e da Fase 6.
+Desde a **Fase 5**, o upload já dispara a análise automaticamente: o documento
+entra como `uploaded` e o worker in-process move para `processing` e depois
+`done`/`error`. O que ainda falta é o **frontend** de status/polling e de
+resultado — hoje o `/upload` só mostra o rótulo de status, sem tela de
+resultado. Isso é a Fase 6.
 
 ## O que fica para as próximas fases
 
-- **Fase 5** — Pipeline assíncrono: fila/worker que dispara a análise após o
-  upload sem travar a requisição HTTP, persistindo o resultado em `analyses`
-  e atualizando `documents.status` (`uploaded` → `processing` → `done`/`error`).
 - **Fase 6** — Telas de status/polling e resultado (resumo executivo,
   compliance, sugestões) no frontend.
 - **Fase 7** — Job agendado de retenção de 72h (deleção automática do arquivo

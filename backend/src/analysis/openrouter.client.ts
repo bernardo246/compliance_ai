@@ -5,7 +5,17 @@ const OPENROUTER_URL = 'https://openrouter.ai/api/v1/chat/completions';
 
 interface ChatCompletionResponse {
   choices?: Array<{ message?: { content?: string }; finish_reason?: string }>;
+  usage?: { total_tokens?: number };
   error?: { message?: string; code?: number };
+}
+
+export interface ChatJsonResult {
+  /** Conteúdo textual da resposta (deve ser JSON, mas ainda não validado). */
+  content: string;
+  /** Slug do modelo que efetivamente respondeu. */
+  model: string;
+  /** Total de tokens (prompt + completion), quando o provider reporta. */
+  tokensUsed: number | null;
 }
 
 /**
@@ -23,7 +33,7 @@ export class OpenRouterClient {
 
   constructor(private readonly config: ConfigService) {}
 
-  async chatJson(systemPrompt: string, userContent: string): Promise<string> {
+  async chatJson(systemPrompt: string, userContent: string): Promise<ChatJsonResult> {
     const apiKey = this.config.get<string>('openrouter.apiKey');
     if (!apiKey) {
       throw new Error('OPENROUTER_API_KEY não configurada no .env');
@@ -110,7 +120,7 @@ export class OpenRouterClient {
           );
         }
 
-        return content;
+        return { content, model, tokensUsed: data?.usage?.total_tokens ?? null };
       } catch (err) {
         lastError = err;
         const isLastAttempt = attempt === maxRetries;

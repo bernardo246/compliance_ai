@@ -31,6 +31,16 @@ export default () => ({
     ],
   },
 
+  analysis: {
+    // Fase 5 — pipeline assíncrono in-process (sem Redis). Quantas análises
+    // rodam em paralelo. Modelo grátis costuma ter rate limit apertado, então
+    // 2 é um default conservador.
+    concurrency: parseInt(process.env.ANALYSIS_CONCURRENCY ?? '2', 10),
+    // Um documento preso em 'processing' há mais que isto (ex.: o processo caiu
+    // no meio de uma análise) é reenfileirado na próxima subida do backend.
+    stuckTimeoutMs: parseInt(process.env.ANALYSIS_STUCK_TIMEOUT_MS ?? '600000', 10),
+  },
+
   openrouter: {
     apiKey: process.env.OPENROUTER_API_KEY ?? '',
     // ⚠️ Confirme o slug exato do modelo em https://openrouter.ai/models

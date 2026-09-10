@@ -13,7 +13,8 @@
     "start:prod": "node dist/main",
     "lint": "eslint \"{src,test}/**/*.ts\" --fix",
     "golden:build": "ts-node scripts/build-golden-set.ts",
-    "golden:test": "ts-node scripts/test-golden-set.ts"
+    "golden:test": "ts-node scripts/test-golden-set.ts",
+    "pipeline:test": "TS_NODE_FILES=true ts-node scripts/test-pipeline.ts"
   },
   "dependencies": {
     "@nestjs/common": "^11.2.3",

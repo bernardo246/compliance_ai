@@ -90,18 +90,18 @@ async function main() {
   );
 
   console.log('Analisando contrato COM problemas conhecidos...');
-  const resultadoComProblemas = await analysisService.analyze(comProblemasBuffer, 'pdf', 'juridico');
-  printResult('contrato-com-problemas.pdf', resultadoComProblemas);
+  const comProblemas = await analysisService.analyze(comProblemasBuffer, 'pdf', 'juridico');
+  printResult('contrato-com-problemas.pdf', comProblemas.result);
 
   console.log('\n\nAnalisando contrato bem estruturado...');
-  const resultadoBemEstruturado = await analysisService.analyze(
+  const bemEstruturado = await analysisService.analyze(
     bemEstruturadoBuffer,
     'pdf',
     'juridico',
   );
-  printResult('contrato-bem-estruturado.pdf', resultadoBemEstruturado);
+  printResult('contrato-bem-estruturado.pdf', bemEstruturado.result);
 
-  const { encontrados, faltando } = checkGoldenSet(resultadoComProblemas);
+  const { encontrados, faltando } = checkGoldenSet(comProblemas.result);
 
   console.log(`\n${'='.repeat(70)}`);
   console.log('CONFERÊNCIA DO GOLDEN SET (contrato com problemas)');
