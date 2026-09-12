@@ -1,6 +1,6 @@
 # Plataforma de Análise de Documentos e Dados com IA
 
-Monorepo simples (duas pastas, dois `package.json`) cobrindo as **Fases 0 a 5**
+Monorepo simples (duas pastas, dois `package.json`) cobrindo as **Fases 0 a 6**
 do plano:
 
 - **Fase 0** — Infraestrutura: NestJS + Next.js, config via `.env`, Helmet,
@@ -26,6 +26,12 @@ do plano:
   IA, grava em `analyses` e move `documents.status` `uploaded` → `processing`
   → `done`/`error`. Endpoint `GET /api/analyses/:id`. Testável ponta a ponta
   via `npm run pipeline:test` (ver seção 5.1).
+- **Fase 6** — Frontend de status e resultado: tela `/documentos/[id]` que faz
+  polling do status (`uploaded`/`processing` → atualiza sozinha a cada 4s) e,
+  quando `done`, renderiza o resultado completo (resumo executivo, checklist
+  item a item com veredito/severidade/evidência/sugestão, dados faltantes,
+  sugestões de melhoria, aviso legal). A lista em `/upload` também faz polling
+  e cada item vira link para o resultado.
 
 O visual do frontend segue à risca o `design-system.md` (paleta escura +
 verde, glassmorphism, grid de fundo, glow, tipografia).
@@ -48,6 +54,11 @@ projeto-analise-ia/
 │   └── sql/               # 001_init.sql + 002_analysis_pipeline.sql (rodar no Supabase, em ordem)
 └── frontend/               # Next.js 16 (App Router)
     └── src/
+        ├── app/
+        │   ├── upload/         # Fase 3/6 — envio + lista com polling
+        │   └── documentos/[id]/ # Fase 6 — status/polling + resultado da análise
+        ├── components/         # Navbar, StatusBadge (Fase 6)
+        └── lib/                # api.ts, auth-context.tsx, domain.ts (tipos/rótulos compartilhados)
 ```
 
 ## Pré-requisitos
@@ -298,16 +309,16 @@ npm run dev
 1. `/register` → cria conta → redireciona para `/termos`.
 2. `/termos` → aceite obrigatório → redireciona para `/upload`.
 3. `/upload` → escolhe área de negócio, envia PDF/CSV/XLSX → lista os
-   documentos do usuário com status.
+   documentos do usuário, cada um com o status atual (o upload já dispara a
+   análise — Fase 5) e clicável.
+4. Clicar num documento abre `/documentos/[id]`: enquanto `uploaded`/
+   `processing`, a tela faz polling sozinha (a cada 4s) até virar `done` ou
+   `error`; quando `done`, mostra o resultado completo (resumo executivo,
+   veredito geral, checklist item a item com severidade/evidência/sugestão,
+   dados faltantes, sugestões de melhoria e o aviso legal).
 
 Sem aceitar o termo, `/api/documents/*` responde `403 Forbidden`
 (`TermsAcceptedGuard`) mesmo com um access token válido.
-
-Desde a **Fase 5**, o upload já dispara a análise automaticamente: o documento
-entra como `uploaded` e o worker in-process move para `processing` e depois
-`done`/`error`. O que ainda falta é o **frontend** de status/polling e de
-resultado — hoje o `/upload` só mostra o rótulo de status, sem tela de
-resultado. Isso é a Fase 6.
 
 ## Arquitetura por fase — o que foi feito e como escala
 
@@ -327,6 +338,7 @@ por requisição escala liso.
 | 3 — Upload | ✅ Sim | Nada (atenção operacional: Multer bufferiza em RAM) |
 | 4 — IA (função isolada) | ✅ Sim | Nada no código (cuidado com o rate limit externo da OpenRouter) |
 | 5 — Pipeline assíncrono | ❌ Não | Fila in-process → BullMQ + Redis |
+| 6 — Frontend de status/resultado | ✅ Sim | Nada (frontend é stateless; atenção é ao **volume de polling** que ele gera no backend) |
 
 **Conclusão:** adicionar **um único Redis** resolve a Fase 0 (rate limit
 distribuído) e a Fase 5 (fila durável e compartilhada) de uma vez.
@@ -495,10 +507,41 @@ controllers ou schema. Comparação completa e gatilho de migração na
 
 ---
 
+### Fase 6 — Frontend de Upload e Resultado
+
+**O que faz:** interface para usar o fluxo completo sem tocar em código —
+login/cadastro, aceite de termo, upload, status e resultado.
+
+**Implementado:** login/cadastro/termo já existiam (Fases 0-3). Novidades desta
+fase: a lista em `/upload` agora faz **polling** (a cada 4s, só enquanto algum
+documento estiver `uploaded`/`processing`) e cada item é um link; nova página
+`/documentos/[id]` que também faz polling e, quando `status: done`, renderiza o
+resultado completo — `resumo_executivo`, badge do veredito geral
+(`conforme`/`nao_conforme`/`parcial`/`nao_verificavel`), o checklist item a
+item (nome, veredito, severidade, referência normativa, evidência entre aspas,
+sugestão de correção), `dados_faltantes`, `sugestoes_melhoria` e o
+`aviso_legal`. Em caso de `status: error`, mostra a mensagem de
+`documents.erro`. Tipos e rótulos (`AreaNegocio`, `StatusComplianceGeral`,
+`Severidade`, cores dos badges) centralizados em `src/lib/domain.ts` para não
+duplicar entre as duas páginas.
+
+| Componente | Onde vive o estado | Escala? |
+|---|---|---|
+| Next.js (páginas, build) | Stateless — SSR/estático, sem sessão de servidor | ✅ qualquer número de instâncias ou CDN |
+| Access token | Memória do módulo JS, por aba do navegador — não é estado de servidor | ✅ (cada aba reobtém via refresh cookie ao recarregar) |
+| Polling (`/upload`, `/documentos/[id]`) | Nenhum estado — é só o cliente repetindo a requisição HTTP | ⚠️ Não quebra, mas **soma carga de leitura no backend**: N usuários com abas abertas em documentos `processing` = N requisições a cada 4s |
+
+**Para escalar:** nada no frontend em si — é stateless por natureza. O ponto de
+atenção é o **volume de polling** gerado no backend sob muitos usuários
+simultâneos com análises em andamento. Mitigações, se o volume justificar:
+backoff progressivo no intervalo (4s → 8s → 15s quanto mais tempo em
+`processing`), ou trocar polling por push (SSE/WebSocket) avisando quando o
+status muda.
+
+---
+
 ## O que fica para as próximas fases
 
-- **Fase 6** — Telas de status/polling e resultado (resumo executivo,
-  compliance, sugestões) no frontend.
 - **Fase 7** — Job agendado de retenção de 72h (deleção automática do arquivo
   original do Storage).
 - **Fase 8** — Hardening de segurança (scan antivírus no upload, revisão

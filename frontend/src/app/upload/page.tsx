@@ -1,36 +1,19 @@
 'use client';
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
+import Link from 'next/link';
 import { FileText, Loader2, UploadCloud } from 'lucide-react';
 import { useAuth } from '@/lib/auth-context';
 import { apiFetch, apiJson } from '@/lib/api';
 import { Navbar } from '@/components/Navbar';
+import { StatusBadge } from '@/components/StatusBadge';
+import { AREAS, areaLabel, DocumentItem, isPendingStatus } from '@/lib/domain';
 
-const AREAS = [
-  { value: 'financas', label: 'Finanças' },
-  { value: 'juridico', label: 'Jurídico' },
-  { value: 'imobiliario', label: 'Imobiliário' },
-  { value: 'rh', label: 'Recursos Humanos' },
-  { value: 'saude', label: 'Saúde' },
-  { value: 'outro', label: 'Outro' },
-] as const;
-
-interface DocumentItem {
-  id: string;
-  nome_original: string;
-  tipo: string;
-  area_negocio: string;
-  status: 'uploaded' | 'processing' | 'done' | 'error';
-  created_at: string;
-}
-
-const STATUS_LABEL: Record<DocumentItem['status'], string> = {
-  uploaded: 'Enviado',
-  processing: 'Processando',
-  done: 'Concluído',
-  error: 'Erro',
-};
+// Enquanto algum documento estiver uploaded/processing, a lista é
+// atualizada nesse intervalo — é o "polling" da Fase 6 (critério de pronto:
+// ver o status mudar sem tocar em código / sem dar F5 manual).
+const POLL_INTERVAL_MS = 4000;
 
 export default function UploadPage() {
   const { user, loading } = useAuth();
@@ -55,8 +38,10 @@ export default function UploadPage() {
     try {
       const data = await apiJson<DocumentItem[]>('/api/documents');
       setDocuments(data);
+      return data;
     } catch {
       // silencioso — a lista é secundária à ação de upload
+      return null;
     } finally {
       setLoadingDocs(false);
     }
@@ -67,6 +52,24 @@ export default function UploadPage() {
     // eslint-disable-next-line react-hooks/set-state-in-effect -- fetch-on-mount é o padrão canônico aqui; loadDocuments só seta estado após a resposta da API (assíncrono).
     void loadDocuments();
   }, [user, loadDocuments]);
+
+  // Fase 6 — enquanto houver documento em 'uploaded'/'processing', repolla a
+  // lista periodicamente para o rótulo de status virar 'Concluído'/'Erro'
+  // sozinho (sem o usuário precisar dar F5).
+  const pollRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => {
+    if (!user?.terms_accepted) return;
+    const hasPending = documents.some((doc) => isPendingStatus(doc.status));
+    if (!hasPending) return;
+
+    pollRef.current = setTimeout(() => {
+      void loadDocuments();
+    }, POLL_INTERVAL_MS);
+
+    return () => {
+      if (pollRef.current) clearTimeout(pollRef.current);
+    };
+  }, [documents, user, loadDocuments]);
 
   const handleDrop = (e: React.DragEvent<HTMLDivElement>) => {
     e.preventDefault();
@@ -192,23 +195,22 @@ export default function UploadPage() {
             ) : (
               <ul className="mt-6 space-y-3">
                 {documents.map((doc) => (
-                  <li
-                    key={doc.id}
-                    className="flex items-center justify-between rounded-xl border border-borderSoft bg-white/5 px-4 py-3"
-                  >
-                    <div className="flex items-center gap-3">
-                      <FileText className="h-4 w-4 text-brand" aria-hidden />
-                      <div>
-                        <p className="text-sm">{doc.nome_original}</p>
-                        <p className="text-xs text-textSecondary">
-                          {AREAS.find((a) => a.value === doc.area_negocio)?.label ?? doc.area_negocio} ·{' '}
-                          {doc.tipo.toUpperCase()}
-                        </p>
+                  <li key={doc.id}>
+                    <Link
+                      href={`/documentos/${doc.id}`}
+                      className="focus-ring flex items-center justify-between rounded-xl border border-borderSoft bg-white/5 px-4 py-3 transition hover:border-brand/40"
+                    >
+                      <div className="flex items-center gap-3">
+                        <FileText className="h-4 w-4 text-brand" aria-hidden />
+                        <div>
+                          <p className="text-sm">{doc.nome_original}</p>
+                          <p className="text-xs text-textSecondary">
+                            {areaLabel(doc.area_negocio)} · {doc.tipo.toUpperCase()}
+                          </p>
+                        </div>
                       </div>
-                    </div>
-                    <span className="rounded-full border border-borderSoft px-2.5 py-1 text-xs text-textSecondary">
-                      {STATUS_LABEL[doc.status]}
-                    </span>
+                      <StatusBadge status={doc.status} />
+                    </Link>
                   </li>
                 ))}
               </ul>
