@@ -14,7 +14,8 @@
     "lint": "eslint \"{src,test}/**/*.ts\" --fix",
     "golden:build": "ts-node scripts/build-golden-set.ts",
     "golden:test": "ts-node scripts/test-golden-set.ts",
-    "pipeline:test": "TS_NODE_FILES=true ts-node scripts/test-pipeline.ts"
+    "pipeline:test": "TS_NODE_FILES=true ts-node scripts/test-pipeline.ts",
+    "retention:test": "TS_NODE_FILES=true ts-node scripts/test-retention.ts"
   },
   "dependencies": {
     "@nestjs/common": "^11.2.3",
@@ -23,6 +24,7 @@
     "@nestjs/jwt": "^12.0.1",
     "@nestjs/passport": "^11.0.5",
     "@nestjs/platform-express": "^11.2.3",
+    "@nestjs/schedule": "^12.0.1",
     "@nestjs/throttler": "^6.5.0",
     "@supabase/supabase-js": "^2.112.4",
     "bcrypt": "^6.0.0",

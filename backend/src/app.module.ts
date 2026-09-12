@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { APP_GUARD } from '@nestjs/core';
 import { ConfigModule } from '@nestjs/config';
 import { ThrottlerModule, ThrottlerGuard } from '@nestjs/throttler';
+import { ScheduleModule } from '@nestjs/schedule';
 import configuration from './config/configuration';
 import { SupabaseModule } from './common/supabase/supabase.module';
 import { JwtAuthGuard } from './common/guards/jwt-auth.guard';
@@ -14,6 +15,7 @@ import { HealthController } from './health.controller';
 @Module({
   imports: [
     ConfigModule.forRoot({ isGlobal: true, load: [configuration] }),
+    ScheduleModule.forRoot(), // Fase 7 — habilita @Cron() (RetentionService)
     ThrottlerModule.forRoot([
       {
         // Fase 0/8 — rate limit básico contra brute-force em login/registro.

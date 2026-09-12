@@ -1,6 +1,6 @@
 # Plataforma de Análise de Documentos e Dados com IA
 
-Monorepo simples (duas pastas, dois `package.json`) cobrindo as **Fases 0 a 6**
+Monorepo simples (duas pastas, dois `package.json`) cobrindo as **Fases 0 a 7**
 do plano:
 
 - **Fase 0** — Infraestrutura: NestJS + Next.js, config via `.env`, Helmet,
@@ -32,6 +32,12 @@ do plano:
   item a item com veredito/severidade/evidência/sugestão, dados faltantes,
   sugestões de melhoria, aviso legal). A lista em `/upload` também faz polling
   e cada item vira link para o resultado.
+- **Fase 7** — Retenção de 72h: job agendado (`@nestjs/schedule`, a cada hora)
+  varre `documents` com `expira_em` vencido, remove **só o arquivo original**
+  do Storage e marca `storage_path = null` + `deletado_em` — o resultado em
+  `analyses` nunca é tocado. Exclusão antecipada pelo próprio usuário já existe
+  desde a Fase 3 (`DELETE /api/documents/:id`). Testável via
+  `npm run retention:test` (ver seção 5.2).
 
 O visual do frontend segue à risca o `design-system.md` (paleta escura +
 verde, glassmorphism, grid de fundo, glow, tipografia).
@@ -47,11 +53,11 @@ projeto-analise-ia/
 ├── backend/
 │   ├── src/
 │   │   ├── auth/          # Fase 1-2
-│   │   ├── documents/     # Fase 3
+│   │   ├── documents/     # Fase 3 (upload) + retention.service.ts (Fase 7 — cron de 72h)
 │   │   └── analysis/      # Fase 4-5 — extração, prompt, OpenRouter, schema, runner
-│   ├── scripts/           # golden set (Fase 4) + teste de pipeline (Fase 5)
+│   ├── scripts/           # golden set (Fase 4) + teste de pipeline (Fase 5) + teste de retenção (Fase 7)
 │   ├── test-fixtures/     # PDFs de teste com problemas conhecidos injetados
-│   └── sql/               # 001_init.sql + 002_analysis_pipeline.sql (rodar no Supabase, em ordem)
+│   └── sql/               # 001_init + 002_analysis_pipeline + 003_retention.sql (rodar no Supabase, em ordem)
 └── frontend/               # Next.js 16 (App Router)
     └── src/
         ├── app/
@@ -91,9 +97,10 @@ projeto-analise-ia/
    `refresh_tokens`, `documents`, `analyses`, `audit_logs`.
 6. Repita os passos 2-4 com `backend/sql/002_analysis_pipeline.sql` (colunas da
    Fase 5: `analyses.checklist`, `analyses.status_compliance_geral`,
-   `documents.processing_started_at`, `documents.erro`, etc.). Rodar **depois**
-   da 001. Ambas são idempotentes (`if not exists`), então rodar de novo não
-   quebra nada.
+   `documents.processing_started_at`, `documents.erro`, etc.), e depois com
+   `backend/sql/003_retention.sql` (índice usado pela varredura da Fase 7).
+   Rodar **na ordem** (001 → 002 → 003). Todas são idempotentes
+   (`if not exists`), então rodar de novo não quebra nada.
 
 ### 1.3. Criar o bucket de Storage
 
@@ -294,6 +301,43 @@ típico de MVP), a fila in-process entrega o mesmo resultado funcional. A
 migração é localizada — `enqueue()` vira `queue.add()`, o loop vira
 `new Worker()` — sem tocar em `DocumentsService`, controllers ou schema.
 
+### 5.2. Testando a retenção de 72h (Fase 7)
+
+Prova o critério de pronto sem esperar o cron rodar de verdade nem esperar
+72h: chama `RetentionService.purgeExpired()` diretamente contra dois
+documentos de teste — um com `expira_em` forçado para o passado, outro
+(controle) com `expira_em` no futuro.
+
+```bash
+cd backend
+npm run retention:test
+```
+
+```
+[EXPIRADO] storage_path=null deletado_em=2026-... → ✅ limpo como esperado
+[EXPIRADO] arquivo no Storage → ✅ removido
+[EXPIRADO] registro em analyses → ✅ intacto (não foi tocado)
+
+[CONTROLE] storage_path=.../controle.pdf deletado_em=null → ✅ não foi tocado (correto)
+
+✅ Critério de pronto da Fase 7 atendido.
+```
+
+**Como funciona no backend:**
+
+- `RetentionService.purgeExpired()` (`src/documents/retention.service.ts`),
+  decorado com `@Cron(CronExpression.EVERY_HOUR)` — habilitado via
+  `ScheduleModule.forRoot()` em `app.module.ts`.
+- A cada hora, varre `documents` com `deletado_em is null`, `storage_path`
+  presente e `expira_em` vencido. Para cada um: remove o arquivo do Storage,
+  depois `storage_path = null` + `deletado_em = now()`. **Nunca** apaga a
+  linha de `documents` nem toca em `analyses` — só o binário original some.
+- Erro num documento não derruba a varredura dos demais (loop com
+  try/catch por item, contadores de `processados`/`falhas` no log).
+- A exclusão antecipada pelo usuário (`DELETE /api/documents/:id`) já existia
+  desde a Fase 3 e tem o mesmo efeito final — só que disparada por request,
+  não pelo cron.
+
 ## 6. Frontend
 
 ```bash
@@ -339,9 +383,12 @@ por requisição escala liso.
 | 4 — IA (função isolada) | ✅ Sim | Nada no código (cuidado com o rate limit externo da OpenRouter) |
 | 5 — Pipeline assíncrono | ❌ Não | Fila in-process → BullMQ + Redis |
 | 6 — Frontend de status/resultado | ✅ Sim | Nada (frontend é stateless; atenção é ao **volume de polling** que ele gera no backend) |
+| 7 — Retenção de 72h | ⚠️ Quase | `@Cron` roda por processo → com N instâncias, todas disparam a mesma varredura na mesma hora |
 
 **Conclusão:** adicionar **um único Redis** resolve a Fase 0 (rate limit
-distribuído) e a Fase 5 (fila durável e compartilhada) de uma vez.
+distribuído) e a Fase 5 (fila durável e compartilhada) de uma vez — e também
+dá uma saída pronta para a Fase 7 (repeatable job do BullMQ roda uma vez só,
+não por instância).
 
 ---
 
@@ -540,10 +587,45 @@ status muda.
 
 ---
 
+### Fase 7 — Retenção de 72h
+
+**O que faz:** automatiza a exclusão do arquivo original 72h após o upload —
+minimização de dados (LGPD, art. 6º, III), reduzindo a janela de exposição do
+documento sem perder o resultado da análise.
+
+**Implementado:** `RetentionService.purgeExpired()`, decorado com
+`@Cron(CronExpression.EVERY_HOUR)` (`@nestjs/schedule`, habilitado via
+`ScheduleModule.forRoot()`). A cada hora, varre `documents` com `deletado_em
+is null`, `storage_path` presente e `expira_em` vencido; para cada um, remove
+o arquivo do Storage e grava `storage_path = null` + `deletado_em = now()` —
+**a linha de `documents` e o registro em `analyses` nunca são apagados**, só o
+binário original some. Erro num documento não interrompe a varredura dos
+demais. A exclusão antecipada pelo usuário (`DELETE /api/documents/:id`) já
+existia desde a Fase 3 e produz o mesmo efeito final. Validado por
+`npm run retention:test` (seção 5.2): documento com `expira_em` forçado para o
+passado é limpo, um documento de controle com `expira_em` no futuro não é
+tocado, e a `analyses` associada ao documento limpo continua intacta.
+
+| Componente | Onde vive o estado | Escala? |
+|---|---|---|
+| **Agendamento do `@Cron`** | **Registrado por processo** (o `ScheduleModule` de cada instância dispara o seu próprio timer) | ⚠️ Com N instâncias, todas rodam a mesma varredura na mesma hora — cada uma tenta limpar os mesmos documentos expirados |
+| Query dos documentos expirados | Postgres (`documents`) | ✅ |
+| Remoção do Storage + atualização do documento | Supabase Storage + Postgres (compartilhados) | ✅ **idempotente** — reprocessar um documento já limpo não corrompe nada (`storage_path` já é `null`, o update vira no-op); só desperdiça uma chamada ao Storage |
+| Exclusão antecipada (`DELETE /api/documents/:id`) | Por request, sem estado local | ✅ |
+
+**Para escalar:** o efeito final é sempre correto (idempotente), mas com N
+instâncias o trabalho é duplicado N vezes toda hora — nada quebra, só
+desperdiça chamadas ao Storage. Para eliminar de vez a duplicação: um lock
+distribuído (`pg_try_advisory_lock` no Postgres, só uma instância "ganha" a
+execução daquela hora), rodar a varredura como `pg_cron` no próprio Supabase
+em vez de no processo do backend, ou — se o Redis da Fase 5 já existir —
+migrar para um *repeatable job* do BullMQ, que roda uma vez só independente de
+quantas instâncias do worker estejam de pé.
+
+---
+
 ## O que fica para as próximas fases
 
-- **Fase 7** — Job agendado de retenção de 72h (deleção automática do arquivo
-  original do Storage).
 - **Fase 8** — Hardening de segurança (scan antivírus no upload, revisão
   completa do checklist de segurança).
 - **Fase 9** — Templates de prompt para as demais áreas (`financas`,
@@ -565,3 +647,7 @@ status muda.
   seguir adiante com dado ruim.
 - Chamada à API de IA com timeout configurável e retry com backoff
   exponencial (não trava indefinidamente, não esgota tentativas em rajada).
+- Arquivo original excluído automaticamente 72h após o upload (job agendado,
+  Fase 7) ou antes disso por pedido do usuário — minimização de dados (LGPD,
+  art. 6º, III); o resultado da análise em `analyses` não depende do arquivo
+  original e não é afetado pela exclusão.
