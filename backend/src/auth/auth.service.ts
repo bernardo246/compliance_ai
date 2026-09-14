@@ -87,7 +87,7 @@ export class AuthService {
     return match ? parseInt(match[1], 10) : 7;
   }
 
-  async register(dto: RegisterDto) {
+  async register(dto: RegisterDto, ip?: string) {
     const { data: existing } = await this.db()
       .from('users')
       .select('id')
@@ -116,13 +116,13 @@ export class AuthService {
       throw new Error(`Falha ao criar usuário: ${error?.message}`);
     }
 
-    await this.logAudit(user.id, 'register');
+    await this.logAudit(user.id, 'register', ip);
 
     const tokens = await this.signTokens(user);
     return { user, ...tokens };
   }
 
-  async login(dto: LoginDto) {
+  async login(dto: LoginDto, ip?: string) {
     const { data: user, error } = await this.db()
       .from('users')
       .select('id, email, password_hash, role')
@@ -130,17 +130,22 @@ export class AuthService {
       .maybeSingle();
 
     if (error || !user) {
+      // E-mail não cadastrado. `user_id` fica null (não há usuário a
+      // referenciar) — mas o evento é logado mesmo assim, senão uma
+      // enumeração de e-mails/brute-force contra contas inexistentes fica
+      // sem qualquer rastro de auditoria.
+      await this.logAudit(null, 'login_failed', ip);
       throw new UnauthorizedException('E-mail ou senha inválidos.');
     }
 
     const passwordMatches = await bcrypt.compare(dto.password, user.password_hash);
 
     if (!passwordMatches) {
-      await this.logAudit(user.id, 'login_failed');
+      await this.logAudit(user.id, 'login_failed', ip);
       throw new UnauthorizedException('E-mail ou senha inválidos.');
     }
 
-    await this.logAudit(user.id, 'login');
+    await this.logAudit(user.id, 'login', ip);
 
     const tokens = await this.signTokens(user);
     return {
@@ -154,7 +159,7 @@ export class AuthService {
    * (access + refresh) é emitido. Se o token já tiver sido usado/revogado,
    * tratamos como possível reuso de token vazado e revogamos toda a família.
    */
-  async refresh(refreshToken: string) {
+  async refresh(refreshToken: string, ip?: string) {
     const tokenHash = this.hashRefreshToken(refreshToken);
 
     const { data: stored, error } = await this.db()
@@ -168,11 +173,17 @@ export class AuthService {
     }
 
     if (stored.revoked || new Date(stored.expires_at) < new Date()) {
-      // Reuso de token revogado/expirado — por segurança, revoga tudo do usuário.
+      // Reuso de token já revogado (ou expirado) — indício de token vazado/
+      // roubado sendo reaproveitado. Evento de segurança: logado explicitamente,
+      // e por segurança revoga toda a família de refresh tokens do usuário.
+      const jaEraRevogado = stored.revoked;
       await this.db()
         .from('refresh_tokens')
         .update({ revoked: true })
         .eq('user_id', stored.user_id);
+      if (jaEraRevogado) {
+        await this.logAudit(stored.user_id, 'refresh_token_reuse_detected', ip);
+      }
       throw new UnauthorizedException('Refresh token expirado ou já utilizado. Faça login novamente.');
     }
 
@@ -194,15 +205,26 @@ export class AuthService {
     return this.signTokens(user);
   }
 
-  async logout(refreshToken: string) {
+  async logout(refreshToken: string, ip?: string) {
     const tokenHash = this.hashRefreshToken(refreshToken);
+
+    const { data: stored } = await this.db()
+      .from('refresh_tokens')
+      .select('user_id')
+      .eq('token_hash', tokenHash)
+      .maybeSingle();
+
     await this.db()
       .from('refresh_tokens')
       .update({ revoked: true })
       .eq('token_hash', tokenHash);
+
+    if (stored) {
+      await this.logAudit(stored.user_id, 'logout', ip);
+    }
   }
 
-  async acceptTerms(userId: string, version: string) {
+  async acceptTerms(userId: string, version: string, ip?: string) {
     const currentVersion = this.config.get<string>('terms.currentVersion');
 
     if (version !== currentVersion) {
@@ -224,11 +246,11 @@ export class AuthService {
       throw new Error(`Falha ao registrar aceite do termo: ${error.message}`);
     }
 
-    await this.logAudit(userId, 'accept_terms');
+    await this.logAudit(userId, 'accept_terms', ip);
     return { termsAccepted: true, version };
   }
 
-  private async logAudit(userId: string, acao: string, ip?: string) {
+  private async logAudit(userId: string | null, acao: string, ip?: string) {
     await this.db()
       .from('audit_logs')
       .insert({ id: randomUUID(), user_id: userId, acao, ip_address: ip ?? null });

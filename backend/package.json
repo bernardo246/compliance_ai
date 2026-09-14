@@ -15,7 +15,9 @@
     "golden:build": "ts-node scripts/build-golden-set.ts",
     "golden:test": "ts-node scripts/test-golden-set.ts",
     "pipeline:test": "TS_NODE_FILES=true ts-node scripts/test-pipeline.ts",
-    "retention:test": "TS_NODE_FILES=true ts-node scripts/test-retention.ts"
+    "retention:test": "TS_NODE_FILES=true ts-node scripts/test-retention.ts",
+    "malware-scan:test": "TS_NODE_FILES=true ts-node scripts/test-malware-scan.ts",
+    "security:test": "TS_NODE_FILES=true ts-node scripts/test-security.ts"
   },
   "dependencies": {
     "@nestjs/common": "^11.2.3",

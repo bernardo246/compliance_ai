@@ -1,6 +1,6 @@
 # Plataforma de Análise de Documentos e Dados com IA
 
-Monorepo simples (duas pastas, dois `package.json`) cobrindo as **Fases 0 a 7**
+Monorepo simples (duas pastas, dois `package.json`) cobrindo as **Fases 0 a 8**
 do plano:
 
 - **Fase 0** — Infraestrutura: NestJS + Next.js, config via `.env`, Helmet,
@@ -38,6 +38,13 @@ do plano:
   `analyses` nunca é tocado. Exclusão antecipada pelo próprio usuário já existe
   desde a Fase 3 (`DELETE /api/documents/:id`). Testável via
   `npm run retention:test` (ver seção 5.2).
+- **Fase 8** — Hardening de segurança: rate limit dedicado em login/registro
+  (5/min) e upload (10/min); logs de auditoria com IP real cobrindo login,
+  login falho (inclusive e-mail desconhecido), logout, reuso de refresh token,
+  upload e exclusão; Helmet com CSP/HSTS explícitos; verificação de malware no
+  upload (heurística de PDF sempre ativa + ClamAV plugável, desligado por
+  padrão); checklist de segurança da spec revisado item a item. Testável via
+  `npm run malware-scan:test` e `npm run security:test` (ver seção 5.3).
 
 O visual do frontend segue à risca o `design-system.md` (paleta escura +
 verde, glassmorphism, grid de fundo, glow, tipografia).
@@ -52,10 +59,11 @@ vulnerabilidades conhecidas na árvore de dependências no momento da entrega.
 projeto-analise-ia/
 ├── backend/
 │   ├── src/
-│   │   ├── auth/          # Fase 1-2
-│   │   ├── documents/     # Fase 3 (upload) + retention.service.ts (Fase 7 — cron de 72h)
+│   │   ├── auth/          # Fase 1-2 (Fase 8: rate limit dedicado + logs de auditoria)
+│   │   ├── documents/     # Fase 3 (upload) + retention.service.ts (Fase 7)
+│   │   │   └── security/  # Fase 8 — malware-scan.service.ts, pdf-heuristics.ts, clamav.client.ts
 │   │   └── analysis/      # Fase 4-5 — extração, prompt, OpenRouter, schema, runner
-│   ├── scripts/           # golden set (Fase 4) + teste de pipeline (Fase 5) + teste de retenção (Fase 7)
+│   ├── scripts/           # golden set (F4) + pipeline (F5) + retenção (F7) + malware/segurança (F8)
 │   ├── test-fixtures/     # PDFs de teste com problemas conhecidos injetados
 │   └── sql/               # 001_init + 002_analysis_pipeline + 003_retention.sql (rodar no Supabase, em ordem)
 └── frontend/               # Next.js 16 (App Router)
@@ -338,6 +346,98 @@ npm run retention:test
   desde a Fase 3 e tem o mesmo efeito final — só que disparada por request,
   não pelo cron.
 
+### 5.3. Testando o hardening de segurança (Fase 8)
+
+Dois scripts, cada um cobrindo uma parte do checklist:
+
+```bash
+cd backend
+npm run malware-scan:test   # heurística de PDF + integração com o MalwareScanService
+npm run security:test       # sobe a app de verdade (HTTP) e testa como um cliente externo
+```
+
+`malware-scan:test` roda a heurística direto contra um PDF limpo (gerado com
+`pdf-lib`) e um PDF com marcadores de `/OpenAction`+`/JavaScript` embutidos, e
+depois repete pelo `MalwareScanService` (cobre a integração via DI). Se
+`ANTIVIRUS_ENABLED=true`, também testa a string **EICAR** — o arquivo de
+teste padrão da indústria de antivírus (não é malware de verdade) — contra o
+ClamAV configurado; sem isso, o teste do ClamAV é pulado (comportamento
+esperado, não uma falha).
+
+`security:test` é diferente dos outros scripts: ele sobe a aplicação real via
+HTTP numa porta efêmera (`app.listen(0)`) e bate nela como um cliente externo
+bateria — não chama services por dentro. Cria dois usuários (A e B), A sobe um
+documento, e confere:
+
+```
+✅ Usuário A consegue ler o PRÓPRIO documento
+✅ Usuário B NÃO consegue ler o documento do usuário A (espera 404) — status 404
+✅ Usuário B NÃO consegue apagar o documento do usuário A (espera 404) — status 404
+✅ Sem token de acesso, a rota responde 401 — status 401
+
+Martelando POST /api/auth/login com senha errada...
+  status codes: [401, 401, 401, 401, 401, 429, 429, 429]
+✅ Rate limit estoura em algum momento (429) antes de esgotar as 8 tentativas
+```
+
+Isso é literalmente o critério de pronto da Fase 8 executado
+("tentar acessar documento de outro usuário, tentar estourar rate limit").
+Repare que o retorno pra um documento de outro usuário é **404, não 403** —
+de propósito: um 403 revelaria que o documento existe (só que não é seu); o
+404 não distingue "não existe" de "não é seu".
+
+**O que mudou no backend:**
+
+| Área | Antes da Fase 8 | Depois |
+|---|---|---|
+| Rate limit | 30/min uniforme em toda rota (`ThrottlerModule.forRoot`) | Continua 30/min de base, mas `POST /api/auth/login`\|`register` caem pra **5/min** e `POST /api/documents` pra **10/min** via `@Throttle({ default: {...} })` — cada rota já tinha bucket próprio (chave inclui o nome do handler), só o limite era frouxo demais pras duas mais sensíveis a abuso |
+| Logs de auditoria | Só `upload`/`delete_document`/`register`/`login`/`login_failed` (senha errada)/`accept_terms`; `ip_address` sempre `null` | + `login_failed` também no caso de **e-mail desconhecido** (fechava um ponto cego de enumeração/brute-force sem rastro); + `logout`; + `refresh_token_reuse_detected` (evento de segurança — reaproveitar um refresh token já rotacionado); `ip_address` populado de verdade via `@Ip()` |
+| Headers HTTP | `helmet()` só com os defaults | CSP explícita (`default-src 'none'`, apropriada pra uma API que não serve HTML), HSTS com `maxAge` de 180 dias, `crossOriginResourcePolicy: same-origin`. `TRUST_PROXY` (env, default off) liga `X-Forwarded-For` só quando de fato existe um reverse proxy na frente — necessário pra `req.ip` (rate limit e auditoria) refletir o IP real do cliente em produção |
+| Antivírus no upload | TODO no código (`validateFile`) | `MalwareScanService`: heurística estática de PDF **sempre ativa** (rejeita `/JavaScript`, `/OpenAction`, `/Launch`, `/EmbeddedFile`, `/RichMedia` — os vetores mais comuns de PDF malicioso, sem precisar de nenhum serviço externo) + cliente ClamAV (`clamd`, protocolo `INSTREAM` implementado direto sobre `net`, **zero dependências novas**) plugável via `ANTIVIRUS_ENABLED` |
+
+**Sobre o ClamAV — honestidade em vez de teatro de segurança:** o cliente
+ClamAV é real e funcional (fala o protocolo `INSTREAM` de verdade), mas
+**nenhum `clamd` roda neste ambiente de desenvolvimento** — não há
+infraestrutura pra isso aqui. `ANTIVIRUS_ENABLED=false` por padrão, e o
+backend avisa alto no boot (`ANTIVIRUS_ENABLED=false — uploads passam só pela
+heurística estática...`) que a camada de assinaturas está desligada. Pra
+ligar de verdade: suba um `clamd` (ex.: `docker run -p 3310:3310
+clamav/clamav`) e aponte `CLAMAV_HOST`/`CLAMAV_PORT`. Com o antivírus ligado e
+o `clamd` inacessível, o upload é **recusado** (fail closed) — nunca aceito
+"sem verificar".
+
+**Checklist de segurança da spec (seção 11), revisado item a item:**
+
+| Item | Status | Observação |
+|---|---|---|
+| JWT (access curto + refresh rotativo, RS256) | ✅ | Fase 1 |
+| Hash de senha com bcrypt | ✅ | custo 12, Fase 1 |
+| RBAC + RLS no Supabase | ✅ RBAC · ⚠️ RLS | RBAC real via guards. RLS está ligado nas 5 tabelas mas **sem nenhuma policy** — funciona como "nega tudo" pra `anon`/`authenticated`. A fronteira de autorização que efetivamente protege os dados hoje é a **aplicação** (`service_role` bypassa RLS; toda query já filtra por `user_id`) — RLS é defesa em profundidade caso algo um dia acesse o Postgres direto. Ver verificação manual abaixo |
+| Rate limiting (login e uploads) | ✅ | Fase 8 — limites dedicados, ver tabela acima |
+| CORS restrito + Helmet + HSTS | ✅ | CORS restrito ao `FRONTEND_URL` desde a Fase 0; CSP/HSTS explícitos desde a Fase 8 |
+| Validação de tipo/tamanho de arquivo + antivírus | ✅ tipo/tamanho · ⚠️ antivírus | Magic bytes + limite de 20MB desde a Fase 3. Antivírus: heurística sempre ativa + ClamAV plugável, mas **desligado por padrão** neste ambiente (ver acima) |
+| Storage privado com signed URLs | ✅ (mais forte) | Bucket privado, e hoje **não existe nenhum endpoint** que exponha o arquivo original — nem signed URL, nem público. O frontend só vê o resultado da análise. Se um endpoint de download for adicionado no futuro, precisa usar `createSignedUrl` com TTL curto |
+| Secrets fora do código-fonte | ✅ | `.env` fora do git desde o início (`.gitignore`) |
+| Logs de auditoria | ✅ | Fase 8 — cobertura ampliada, IP real, ver tabela acima |
+| Termo de Uso com aceite obrigatório e versionado | ✅ | Fase 2 |
+| Retenção de 72h com deleção automática | ✅ | Fase 7 |
+| `area_negocio` obrigatório no upload | ✅ | Fase 3/4 |
+| Templates de prompt exaustivos por cenário | ✅ (1 de 6 áreas) | Fase 4 — só `juridico`; as demais são a Fase 9 |
+| Veredito de compliance estruturado por item | ✅ | Fase 4 |
+| Aviso de que a análise não substitui parecer profissional | ✅ | campo `aviso_legal`, Fase 4 |
+
+**Verificação manual da postura de RLS** (não dá pra automatizar sem a `anon
+key`, que não fica no `.env` do backend de propósito): pegue a `anon key` do
+seu projeto (Project Settings → API) e rode
+
+```bash
+curl "https://SEU-PROJETO.supabase.co/rest/v1/documents?select=*" \
+  -H "apikey: SUA_ANON_KEY" -H "Authorization: Bearer SUA_ANON_KEY"
+```
+
+Esperado: `[]` — RLS ligado, zero policies, nega tudo pra quem não é
+`service_role`.
+
 ## 6. Frontend
 
 ```bash
@@ -384,6 +484,7 @@ por requisição escala liso.
 | 5 — Pipeline assíncrono | ❌ Não | Fila in-process → BullMQ + Redis |
 | 6 — Frontend de status/resultado | ✅ Sim | Nada (frontend é stateless; atenção é ao **volume de polling** que ele gera no backend) |
 | 7 — Retenção de 72h | ⚠️ Quase | `@Cron` roda por processo → com N instâncias, todas disparam a mesma varredura na mesma hora |
+| 8 — Hardening de segurança | ✅ Sim | Nada de novo — herda a ressalva do rate limiter da Fase 0 (mesmo Redis resolve). ClamAV, se ligado, é um serviço externo compartilhado como o Supabase (todas as instâncias apontam pro mesmo `clamd`), não estado por instância |
 
 **Conclusão:** adicionar **um único Redis** resolve a Fase 0 (rate limit
 distribuído) e a Fase 5 (fila durável e compartilhada) de uma vez — e também
@@ -624,10 +725,80 @@ quantas instâncias do worker estejam de pé.
 
 ---
 
+### Fase 8 — Hardening de Segurança
+
+**O que faz:** fecha as lacunas de segurança do checklist da spec antes de
+uma exposição pública de verdade.
+
+**Implementado:** rate limit dedicado em login/registro (5/min) e upload
+(10/min), além do 30/min geral já existente desde a Fase 0. Logs de auditoria
+ampliados — `login_failed` passa a cobrir e-mail desconhecido (não só senha
+errada), mais `logout` e `refresh_token_reuse_detected` (evento de segurança:
+reaproveitar um refresh token já rotacionado) — todos agora com o IP real do
+cliente (`@Ip()`, com `TRUST_PROXY` controlando se `X-Forwarded-For` é
+confiável). Helmet com CSP e HSTS explícitos em vez dos defaults genéricos.
+`MalwareScanService`: heurística estática de PDF sempre ativa (sem
+dependência externa) mais um cliente ClamAV real (protocolo `INSTREAM`
+implementado sobre `net`, zero dependências novas), plugável via
+`ANTIVIRUS_ENABLED` e com postura *fail closed* se ligado e inacessível.
+Revisão completa do checklist de segurança da spec, item a item (seção 5.3).
+Validado por dois scripts: `npm run malware-scan:test` (heurística + ClamAV
+quando configurado) e `npm run security:test` — que sobe a aplicação real via
+HTTP e prova, como um cliente externo provaria, que um usuário não acessa
+documento de outro (404) e que o rate limit do login realmente barra depois
+de 5 tentativas (429).
+
+| Componente | Onde vive o estado | Escala? |
+|---|---|---|
+| Rate limit dedicado (login/upload) | Mesmo mecanismo da Fase 0 — contadores em RAM, por processo | ⚠️ Herda a mesma ressalva: com N instâncias, o limite efetivo por rota vira `N × limite` |
+| Logs de auditoria | Postgres (`audit_logs`) | ✅ |
+| Heurística de PDF | Pura, por requisição, sem estado | ✅ |
+| ClamAV (`clamd`) | Serviço externo (TCP), compartilhável entre instâncias | ✅ desde que `CLAMAV_HOST` aponte pra um `clamd` alcançável por todas — não pode ser `localhost` a menos que cada instância rode o seu próprio |
+| Headers HTTP (Helmet) | Stateless, por requisição | ✅ |
+
+**Para escalar:** nada novo — a Fase 8 não introduz estado próprio, só reusa
+os mecanismos existentes (throttler in-memory da Fase 0, Postgres, e um
+serviço externo opcional). A mesma correção da Fase 0 (throttler com storage
+em Redis) resolve o rate limit dedicado também.
+
+---
+
+## Infraestrutura externa — o que este repo não inclui
+
+Duas categorias bem diferentes: o que é **obrigatório pra qualquer coisa
+funcionar** (já coberto nas seções 1 e 3 deste README) e o que é **opcional**
+— código já escrito e referenciado (env vars, clients, comentários nas
+tabelas de "como escalar" acima), mas sem o serviço de verdade rodando em
+lugar nenhum. Nenhum destes opcionais impede a aplicação de funcionar hoje;
+cada um resolve um problema específico que só aparece em cenários específicos
+(produção com antivírus de verdade, múltiplas instâncias, etc.).
+
+### Obrigatórios pra rodar
+
+| Serviço | Pra que serve aqui | Onde configurar |
+|---|---|---|
+| **Supabase** (Postgres + Storage) | Banco de dados de toda a aplicação e armazenamento dos arquivos enviados | Seção 1 deste README |
+| **OpenRouter** | Proxy de acesso ao modelo de IA que faz a análise de compliance (Fase 4) | Seção 3 deste README |
+
+### Opcionais — referenciados no código, não inclusos
+
+| Serviço | Pra que serve aqui | Onde está referenciado | Como ligar | Sem ele |
+|---|---|---|---|---|
+| **ClamAV** (`clamd`) | Scanner de vírus/malware por assinatura no upload de documentos (Fase 8) | `MalwareScanService` + `clamav.client.ts` (`src/documents/security/`), atrás de `ANTIVIRUS_ENABLED` | `docker run -p 3310:3310 clamav/clamav`, depois `ANTIVIRUS_ENABLED=true` + `CLAMAV_HOST`/`CLAMAV_PORT` no `.env` — é um switch, o código já fala o protocolo `INSTREAM` de verdade | Só a heurística estática de PDF roda (cobre os vetores mais comuns de PDF malicioso, mas não é um scanner de assinaturas) |
+| **Redis** | Três usos distintos, todos hoje resolvidos sem ele: (1) storage compartilhado do rate limiter, pra N instâncias do backend dividirem o mesmo contador (Fase 0); (2) fila do BullMQ, no lugar do `AnalysisRunnerService` in-process (Fase 5); (3) *repeatable job* do BullMQ pra rodar a retenção de 72h uma vez só entre N instâncias (Fase 7) | Citado nas tabelas "como escalar" das Fases 0, 5 e 7 — **nenhuma linha de código depende dele hoje**, é só a direção de evolução já documentada | Não é um switch — cada um dos 3 usos é uma migração de código (trocar o storage do throttler; reescrever o runner pra `queue.add()`/`new Worker()`; trocar `@Cron` por um repeatable job) | Tudo funciona normalmente numa instância única — só vira necessário ao escalar horizontalmente |
+| **Reverse proxy / load balancer** (Nginx, o proxy do provedor de deploy, etc.) | Terminar HTTPS e distribuir requisições entre instâncias em produção; é o pré-requisito pra `TRUST_PROXY=true` fazer sentido | `TRUST_PROXY` em `configuration.ts`/`main.ts` | Depende do provedor de hospedagem — só ligue `TRUST_PROXY=true` depois de confirmar que existe um proxy de fato na frente | `req.ip` usa o IP direto da conexão TCP — correto tanto em dev local quanto em deploy sem proxy na frente |
+| **`pg_cron`** (extensão nativa do Supabase) | Alternativa ao Redis pra resolver a duplicação de execução do cron da Fase 7 (N instâncias rodando a mesma varredura) **sem precisar de infraestrutura nova** — roda dentro do próprio Postgres do Supabase | Mencionado como opção na seção "Para escalar" da Fase 7 | Habilitar a extensão no painel do Supabase e mover a lógica de `RetentionService.purgeExpired()` pra uma function SQL agendada | O `@Cron` in-process do NestJS cobre uma instância única sem problema |
+
+> Em produção, vale também considerar um **secrets manager** do provedor de
+> hospedagem (Vercel/Railway/Fly.io todos têm um) no lugar do `.env` em texto
+> puro pras chaves JWT e demais segredos — comentado na seção 2, não é um
+> serviço com protocolo próprio como os de cima, por isso não entrou na
+> tabela.
+
+---
+
 ## O que fica para as próximas fases
 
-- **Fase 8** — Hardening de segurança (scan antivírus no upload, revisão
-  completa do checklist de segurança).
 - **Fase 9** — Templates de prompt para as demais áreas (`financas`,
   `imobiliario`, `rh`, `saude`, `outro`) — hoje só `juridico` está implementado.
 
@@ -638,9 +809,21 @@ quantas instâncias do worker estejam de pé.
   reuso de token revogado derruba toda a sessão do usuário.
 - Access token de vida curta (15min), assinado com RS256 (chave privada só no
   backend).
-- Upload valida o tipo real do arquivo pelos magic bytes, não pela extensão.
+- Upload valida o tipo real do arquivo pelos magic bytes, não pela extensão,
+  e passa por verificação de malware (heurística de PDF sempre ativa + ClamAV
+  plugável, Fase 8) antes de ser aceito.
 - RLS habilitado em todas as tabelas (defesa em profundidade, mesmo o backend
   usando a `service_role` key).
+- Rate limit dedicado (mais apertado que o geral) em login/registro e em
+  upload — os dois endpoints mais expostos a abuso (brute-force e custo de
+  Storage/IA, respectivamente).
+- Logs de auditoria com IP do cliente, cobrindo login (inclusive tentativas
+  com e-mail desconhecido), logout, reuso de refresh token, aceite de termo,
+  upload e exclusão de documento.
+- Headers HTTP explícitos (CSP, HSTS, `crossOriginResourcePolicy`) via
+  Helmet, além do CORS restrito ao domínio do frontend.
+- Acesso a documento de outro usuário responde `404`, não `403` — não revela
+  nem que o documento existe.
 - Resposta da IA nunca é confiada "cegamente" — sempre validada
   estruturalmente (schema Zod) antes de qualquer uso; JSON malformado ou fora
   do schema gera um erro claro (`InvalidAnalysisResponseError`) em vez de

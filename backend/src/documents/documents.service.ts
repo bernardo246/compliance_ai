@@ -10,6 +10,7 @@ import { AnalysisRunnerService } from '../analysis/analysis-runner.service';
 import { SupabaseService } from '../common/supabase/supabase.service';
 import { AreaNegocio } from './dto/upload-document.dto';
 import { MIME_TO_TIPO } from './documents.types';
+import { MalwareScanService } from './security/malware-scan.service';
 
 const SEVENTY_TWO_HOURS_MS = 72 * 60 * 60 * 1000;
 
@@ -20,6 +21,7 @@ export class DocumentsService {
     private readonly config: ConfigService,
     private readonly analysisRunner: AnalysisRunnerService,
     private readonly analysisRead: AnalysisReadService,
+    private readonly malwareScan: MalwareScanService,
   ) {}
 
   private db() {
@@ -66,8 +68,9 @@ export class DocumentsService {
       );
     }
 
-    // TODO (Fase 8 — hardening): rodar scan antivírus (ex. ClamAV) aqui
-    // antes de liberar o arquivo para upload no Storage.
+    // Fase 8 — heurística de PDF sempre ativa + ClamAV se ANTIVIRUS_ENABLED=true.
+    // Lança BadRequestException e barra o upload se o arquivo for suspeito.
+    await this.malwareScan.scan(file.buffer, MIME_TO_TIPO[realMime]);
 
     return realMime;
   }
@@ -86,6 +89,7 @@ export class DocumentsService {
     userId: string,
     areaNegocio: AreaNegocio,
     file: Express.Multer.File,
+    ip?: string,
   ) {
     const realMime = await this.validateFile(file);
     const tipo = MIME_TO_TIPO[realMime];
@@ -128,7 +132,7 @@ export class DocumentsService {
       throw new BadRequestException(`Falha ao registrar documento: ${insertError.message}`);
     }
 
-    await this.logAudit(userId, 'upload');
+    await this.logAudit(userId, 'upload', ip);
 
     // Fase 5 — dispara a análise em background. Fire-and-forget de propósito:
     // a resposta do upload não espera a IA (que leva segundos a minutos).
@@ -170,7 +174,7 @@ export class DocumentsService {
     return { ...data, analise };
   }
 
-  async deleteForUser(userId: string, documentId: string) {
+  async deleteForUser(userId: string, documentId: string, ip?: string) {
     const document = await this.findOneForUser(userId, documentId);
     const bucket = this.config.get<string>('supabase.storageBucket')!;
 
@@ -187,13 +191,13 @@ export class DocumentsService {
       throw new BadRequestException(`Falha ao excluir documento: ${error.message}`);
     }
 
-    await this.logAudit(userId, 'delete_document');
+    await this.logAudit(userId, 'delete_document', ip);
     return { success: true };
   }
 
-  private async logAudit(userId: string, acao: string) {
+  private async logAudit(userId: string, acao: string, ip?: string) {
     await this.db()
       .from('audit_logs')
-      .insert({ id: randomUUID(), user_id: userId, acao, ip_address: null });
+      .insert({ id: randomUUID(), user_id: userId, acao, ip_address: ip ?? null });
   }
 }

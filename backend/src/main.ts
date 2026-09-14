@@ -10,7 +10,33 @@ async function bootstrap() {
   const app = await NestFactory.create(AppModule);
   const config = app.get(ConfigService);
 
-  app.use(helmet());
+  // Fase 8 — só habilita se TRUST_PROXY=true (backend atrás de um reverse
+  // proxy conhecido). Sem isso, `req.ip` (usado pelo rate limit e pelos
+  // logs de auditoria) refletiria o IP do proxy, não o do cliente real —
+  // mas confiar em X-Forwarded-For sem ter certeza de que existe um proxy
+  // seria pior (permite falsificar o IP só com um header).
+  if (config.get<boolean>('trustProxy')) {
+    app.getHttpAdapter().getInstance().set('trust proxy', 1);
+  }
+
+  app.use(
+    helmet({
+      // API pura em JSON — não serve HTML/CSS/JS próprio. CSP restritiva por
+      // padrão é defesa em profundidade (ex.: se uma resposta de erro algum
+      // dia acabar sendo renderizada por engano num browser).
+      contentSecurityPolicy: {
+        directives: {
+          defaultSrc: ["'none'"],
+          frameAncestors: ["'none'"],
+        },
+      },
+      hsts: {
+        maxAge: 15552000, // 180 dias
+        includeSubDomains: true,
+      },
+      crossOriginResourcePolicy: { policy: 'same-origin' },
+    }),
+  );
   app.use(cookieParser());
 
   app.enableCors({

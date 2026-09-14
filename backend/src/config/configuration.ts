@@ -2,6 +2,12 @@ export default () => ({
   port: parseInt(process.env.PORT ?? '3001', 10),
   nodeEnv: process.env.NODE_ENV ?? 'development',
   frontendUrl: process.env.FRONTEND_URL ?? 'http://localhost:3000',
+  // Fase 8 — só ligar se o backend estiver de fato atrás de um reverse proxy
+  // conhecido (Nginx, load balancer do provedor, etc.). Liga o suporte do
+  // Express a `X-Forwarded-For`, necessário para `req.ip` (rate limit e
+  // logs de auditoria por IP) refletirem o IP real do cliente em vez do
+  // proxy. Sem proxy na frente (dev local), deixar desligado.
+  trustProxy: process.env.TRUST_PROXY === 'true',
 
   supabase: {
     url: process.env.SUPABASE_URL ?? '',
@@ -29,6 +35,21 @@ export default () => ({
       'application/vnd.ms-excel',
       'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
     ],
+  },
+
+  // Fase 8 — verificação de malware no upload (checklist de segurança).
+  // Duas camadas independentes:
+  //  1. Heurística estática em PDF (sempre ligada, sem dependência externa):
+  //     rejeita PDFs com JavaScript embutido, ações de lançamento de
+  //     programa externo etc. — os vetores mais comuns de PDF malicioso.
+  //  2. ClamAV via protocolo `INSTREAM` do clamd (opcional, `ANTIVIRUS_ENABLED`):
+  //     scanner de verdade, mas precisa de um `clamd` rodando e acessível
+  //     (não vem junto deste repo — ver README, seção de hardening).
+  antivirus: {
+    enabled: process.env.ANTIVIRUS_ENABLED === 'true',
+    host: process.env.CLAMAV_HOST ?? '127.0.0.1',
+    port: parseInt(process.env.CLAMAV_PORT ?? '3310', 10),
+    timeoutMs: parseInt(process.env.CLAMAV_TIMEOUT_MS ?? '15000', 10),
   },
 
   analysis: {

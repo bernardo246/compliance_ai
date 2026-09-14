@@ -3,12 +3,14 @@ import {
   Controller,
   HttpCode,
   HttpStatus,
+  Ip,
   Post,
   Req,
   Res,
   UnauthorizedException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import { Throttle } from '@nestjs/throttler';
 import type { Request, Response } from 'express';
 import { Public } from '../common/decorators/public.decorator';
 import { CurrentUser, AuthenticatedUser } from '../common/decorators/current-user.decorator';
@@ -18,6 +20,10 @@ import { LoginDto } from './dto/login.dto';
 import { AcceptTermsDto } from './dto/accept-terms.dto';
 
 const REFRESH_COOKIE_NAME = 'refresh_token';
+// Fase 8 — login/registro são alvo clássico de brute-force/enumeração de
+// e-mail; o default de 60/min da rota (ThrottlerModule) é frouxo demais
+// para essas duas especificamente.
+const AUTH_THROTTLE = { default: { limit: 5, ttl: 60_000 } };
 
 @Controller('api/auth')
 export class AuthController {
@@ -37,19 +43,29 @@ export class AuthController {
   }
 
   @Public()
+  @Throttle(AUTH_THROTTLE)
   @Post('register')
   @HttpCode(HttpStatus.CREATED)
-  async register(@Body() dto: RegisterDto, @Res({ passthrough: true }) res: Response) {
-    const { user, accessToken, refreshToken } = await this.authService.register(dto);
+  async register(
+    @Body() dto: RegisterDto,
+    @Res({ passthrough: true }) res: Response,
+    @Ip() ip: string,
+  ) {
+    const { user, accessToken, refreshToken } = await this.authService.register(dto, ip);
     this.setRefreshCookie(res, refreshToken);
     return { user, accessToken };
   }
 
   @Public()
+  @Throttle(AUTH_THROTTLE)
   @Post('login')
   @HttpCode(HttpStatus.OK)
-  async login(@Body() dto: LoginDto, @Res({ passthrough: true }) res: Response) {
-    const { user, accessToken, refreshToken } = await this.authService.login(dto);
+  async login(
+    @Body() dto: LoginDto,
+    @Res({ passthrough: true }) res: Response,
+    @Ip() ip: string,
+  ) {
+    const { user, accessToken, refreshToken } = await this.authService.login(dto, ip);
     this.setRefreshCookie(res, refreshToken);
     return { user, accessToken };
   }
@@ -57,22 +73,22 @@ export class AuthController {
   @Public()
   @Post('refresh')
   @HttpCode(HttpStatus.OK)
-  async refresh(@Req() req: Request, @Res({ passthrough: true }) res: Response) {
+  async refresh(@Req() req: Request, @Res({ passthrough: true }) res: Response, @Ip() ip: string) {
     const token = req.cookies?.[REFRESH_COOKIE_NAME];
     if (!token) {
       throw new UnauthorizedException('Refresh token ausente.');
     }
-    const { accessToken, refreshToken } = await this.authService.refresh(token);
+    const { accessToken, refreshToken } = await this.authService.refresh(token, ip);
     this.setRefreshCookie(res, refreshToken);
     return { accessToken };
   }
 
   @Post('logout')
   @HttpCode(HttpStatus.OK)
-  async logout(@Req() req: Request, @Res({ passthrough: true }) res: Response) {
+  async logout(@Req() req: Request, @Res({ passthrough: true }) res: Response, @Ip() ip: string) {
     const token = req.cookies?.[REFRESH_COOKIE_NAME];
     if (token) {
-      await this.authService.logout(token);
+      await this.authService.logout(token, ip);
     }
     res.clearCookie(REFRESH_COOKIE_NAME, { path: '/api/auth' });
     return { success: true };
@@ -80,7 +96,11 @@ export class AuthController {
 
   @Post('accept-terms')
   @HttpCode(HttpStatus.OK)
-  async acceptTerms(@CurrentUser() user: AuthenticatedUser, @Body() dto: AcceptTermsDto) {
-    return this.authService.acceptTerms(user.id, dto.version);
+  async acceptTerms(
+    @CurrentUser() user: AuthenticatedUser,
+    @Body() dto: AcceptTermsDto,
+    @Ip() ip: string,
+  ) {
+    return this.authService.acceptTerms(user.id, dto.version, ip);
   }
 }
