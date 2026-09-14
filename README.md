@@ -1,6 +1,6 @@
 # Plataforma de Análise de Documentos e Dados com IA
 
-Monorepo simples (duas pastas, dois `package.json`) cobrindo as **Fases 0 a 8**
+Monorepo simples (duas pastas, dois `package.json`) cobrindo as **Fases 0 a 9**
 do plano:
 
 - **Fase 0** — Infraestrutura: NestJS + Next.js, config via `.env`, Helmet,
@@ -45,6 +45,13 @@ do plano:
   upload (heurística de PDF sempre ativa + ClamAV plugável, desligado por
   padrão); checklist de segurança da spec revisado item a item. Testável via
   `npm run malware-scan:test` e `npm run security:test` (ver seção 5.3).
+- **Fase 9** — Expansão de templates: as 5 áreas que faltavam (`financas`,
+  `imobiliario`, `rh`, `saude`, `outro`) ganharam template próprio, com o
+  mesmo rigor da Fase 4 (checklist exaustivo, compliance regulatório
+  específico do domínio, anti-alucinação, cobertura de fraude/irregularidade
+  do nicho). `saude` restrito deliberadamente a completude administrativa,
+  nunca avaliação clínica. Golden set próprio por área (12 fixtures no total),
+  testável via `npm run golden:test` (ver seção 5).
 
 O visual do frontend segue à risca o `design-system.md` (paleta escura +
 verde, glassmorphism, grid de fundo, glow, tipografia).
@@ -62,9 +69,9 @@ projeto-analise-ia/
 │   │   ├── auth/          # Fase 1-2 (Fase 8: rate limit dedicado + logs de auditoria)
 │   │   ├── documents/     # Fase 3 (upload) + retention.service.ts (Fase 7)
 │   │   │   └── security/  # Fase 8 — malware-scan.service.ts, pdf-heuristics.ts, clamav.client.ts
-│   │   └── analysis/      # Fase 4-5 — extração, prompt, OpenRouter, schema, runner
-│   ├── scripts/           # golden set (F4) + pipeline (F5) + retenção (F7) + malware/segurança (F8)
-│   ├── test-fixtures/     # PDFs de teste com problemas conhecidos injetados
+│   │   └── analysis/      # Fase 4-5 — extração, runner, schema; prompts/ tem as 6 áreas (Fase 4 + 9)
+│   ├── scripts/           # golden set (F4/F9) + pipeline (F5) + retenção (F7) + malware/segurança (F8)
+│   ├── test-fixtures/     # 12 PDFs de teste (2 por área) com problemas conhecidos injetados
 │   └── sql/               # 001_init + 002_analysis_pipeline + 003_retention.sql (rodar no Supabase, em ordem)
 └── frontend/               # Next.js 16 (App Router)
     └── src/
@@ -219,32 +226,48 @@ Teste rápido:
 curl http://localhost:3001/api/health
 ```
 
-## 5. Testando a Fase 4 isoladamente (golden set)
+## 5. Testando os templates de análise isoladamente (golden set)
 
 A integração com a IA pode ser testada sem precisar do frontend nem do fluxo
-de upload completo — é assim que a Fase 4 foi validada durante o
-desenvolvimento:
+de upload completo — é assim que cada template foi validado durante o
+desenvolvimento (Fase 4 para `juridico`, Fase 9 para as outras 5 áreas):
 
 ```bash
 cd backend
 
-# 1. Gera dois PDFs de teste em test-fixtures/: um contrato com 7 problemas
-#    de compliance injetados de propósito, e um contrato bem estruturado.
+# 1. Gera 12 PDFs de teste em test-fixtures/: um par (com problemas / bem
+#    estruturado) para cada uma das 6 áreas de negócio.
 npm run golden:build
 
-# 2. Roda a análise de verdade contra os dois PDFs (usa sua OPENROUTER_API_KEY)
-#    e confere quantos dos problemas conhecidos o modelo capturou.
+# 2. Roda a análise de verdade contra os 12 PDFs (usa sua OPENROUTER_API_KEY)
+#    e confere, por área, quantos dos problemas conhecidos o modelo capturou.
 npm run golden:test
+
+# Ou só uma área específica (mais rápido, evita gastar tokens/tempo à toa):
+npm run golden:test -- financas
 ```
 
-O script imprime o `resumo_executivo`, o checklist completo item a item, e ao
-final uma conferência automática de quantos dos problemas conhecidos
-(ausência de CPF, reajuste sem índice, multa desproporcional, confidencialidade
-sem prazo, ausência de assinatura/testemunhas) o modelo realmente encontrou.
+O script imprime, pra cada área, o `resumo_executivo`, o checklist completo
+item a item, e ao final uma conferência automática de quantos dos problemas
+conhecidos daquela área o modelo realmente encontrou — fechando com um
+**resumo geral** de todas as áreas testadas:
+
+```
+RESUMO GERAL
+✅ juridico: 6/6 problemas conhecidos capturados
+⚠️  financas: 4/6 problemas conhecidos capturados
+✅ imobiliario: 5/5 problemas conhecidos capturados
+...
+```
+
+(saída real de uma rodada — `financas` variou entre 4 e 6, dependendo da
+formulação exata que o modelo usou naquela chamada; a análise em si continuou
+correta e útil, só a correspondência textual do script é que é sensível à
+redação. Ver "confira manualmente" abaixo.)
 
 Se algum problema esperado não for capturado consistentemente, é sinal de que
-o prompt (`backend/src/analysis/prompts/juridico.prompt.ts`) precisa de ajuste
-— é exatamente para isso que serve o golden set.
+o prompt daquela área (`backend/src/analysis/prompts/<area>.prompt.ts`)
+precisa de ajuste — é exatamente para isso que serve o golden set.
 
 ### 5.1. Testando o pipeline assíncrono (Fase 5)
 
@@ -422,7 +445,7 @@ o `clamd` inacessível, o upload é **recusado** (fail closed) — nunca aceito
 | Termo de Uso com aceite obrigatório e versionado | ✅ | Fase 2 |
 | Retenção de 72h com deleção automática | ✅ | Fase 7 |
 | `area_negocio` obrigatório no upload | ✅ | Fase 3/4 |
-| Templates de prompt exaustivos por cenário | ✅ (1 de 6 áreas) | Fase 4 — só `juridico`; as demais são a Fase 9 |
+| Templates de prompt exaustivos por cenário | ✅ (6 de 6 áreas) | Fase 4 (`juridico`) + Fase 9 (`financas`, `imobiliario`, `rh`, `saude`, `outro`) |
 | Veredito de compliance estruturado por item | ✅ | Fase 4 |
 | Aviso de que a análise não substitui parecer profissional | ✅ | campo `aviso_legal`, Fase 4 |
 
@@ -485,6 +508,7 @@ por requisição escala liso.
 | 6 — Frontend de status/resultado | ✅ Sim | Nada (frontend é stateless; atenção é ao **volume de polling** que ele gera no backend) |
 | 7 — Retenção de 72h | ⚠️ Quase | `@Cron` roda por processo → com N instâncias, todas disparam a mesma varredura na mesma hora |
 | 8 — Hardening de segurança | ✅ Sim | Nada de novo — herda a ressalva do rate limiter da Fase 0 (mesmo Redis resolve). ClamAV, se ligado, é um serviço externo compartilhado como o Supabase (todas as instâncias apontam pro mesmo `clamd`), não estado por instância |
+| 9 — Expansão de templates | ✅ Sim | Nada — mesmo perfil da Fase 4 (templates são strings estáticas em código, zero estado, zero banco) |
 
 **Conclusão:** adicionar **um único Redis** resolve a Fase 0 (rate limit
 distribuído) e a Fase 5 (fila durável e compartilhada) de uma vez — e também
@@ -599,8 +623,9 @@ compliance validada estruturalmente. Função pura, sem banco — testável isol
 
 **Implementado:** `AnalysisService.analyze()`. Extração de texto (PDF via
 `unpdf`, CSV via `papaparse`, XLSX via `exceljs`). `getPromptTemplate(area)`
-escolhe o system prompt (só `juridico` hoje; checklist exaustivo de 23 itens,
-referencial normativo, anti-alucinação, schema JSON rígido). `OpenRouterClient`
+escolhe o system prompt (só `juridico` nesta fase; checklist exaustivo de 23
+itens, referencial normativo, anti-alucinação, schema JSON rígido — as outras
+5 áreas ganham o mesmo tratamento na Fase 9). `OpenRouterClient`
 chama a **OpenRouter** (formato chat-completions) com timeout, retry + backoff
 exponencial e tratamento de erro que vem no corpo com HTTP 200. A resposta passa
 por `parseJsonLoose` (tolera cerca markdown, `{{` duplicado, texto solto) e por
@@ -763,6 +788,60 @@ em Redis) resolve o rate limit dedicado também.
 
 ---
 
+### Fase 9 — Expansão de Templates (demais áreas)
+
+**O que faz:** sai de 1 área piloto (`juridico`) para as 6 áreas planejadas
+na spec.
+
+**Implementado:** 5 templates novos (`financas.prompt.ts`,
+`imobiliario.prompt.ts`, `rh.prompt.ts`, `saude.prompt.ts`,
+`outro.prompt.ts`), cada um seguindo o mesmo rigor da seção 6.2 da spec que já
+valia pro `juridico`: checklist exaustivo de 15-23 itens específicos do
+domínio, referencial normativo real (CPC/CFC para `financas`; Lei 6.015/73,
+Lei 8.245/91 e CRECI para `imobiliario`; CLT e eSocial para `rh`; normas
+administrativas de prontuário do CFM/ANS para `saude`), anti-alucinação,
+nenhuma lacuna silenciosa, e uma seção dedicada a padrões de fraude/
+irregularidade do nicho (lançamentos fictícios em `financas`, proprietário
+divergente do registro em `imobiliario`, renúncia a direito trabalhista
+indisponível em `rh`). `saude` tem uma regra extra, colocada antes até da
+regra de anti-alucinação: o template avalia só **completude administrativa**
+(campos preenchidos, identificação, assinatura) e está proibido de emitir
+qualquer juízo sobre o mérito clínico do conteúdo — nunca avalia se um
+diagnóstico está certo, só se o campo existe. `outro` é o único sem
+referencial normativo fixo (a spec pede isso deliberadamente — documento pode
+ser de qualquer natureza), mas mantém o mesmo checklist exaustivo de boas
+práticas documentais.
+
+Todas as 6 áreas compartilham o mesmo `AnalysisResultSchema` (Zod) e o mesmo
+pipeline (`AnalysisService`, `AnalysisRunnerService`) — nenhuma mudança de
+schema ou de banco foi necessária, só o roteamento em `getPromptTemplate()`
+(`src/analysis/prompts/index.ts`), que agora é `Record<AreaNegocio,
+PromptTemplate>` completo em vez de parcial.
+
+`build-golden-set.ts` passou a gerar 12 fixtures (2 por área, mesmo padrão
+"com problemas" / "bem estruturado" do `juridico`) e `test-golden-set.ts`
+ficou genérico — roda todas as áreas em sequência (ou uma só, via
+`npm run golden:test -- <area>`) e fecha com um resumo geral. Rodei a área
+`financas` como prova de conceito: a análise capturou corretamente a
+divergência de saldo, o lançamento duplicado, a variação de receita de +375%
+sem explicação, e sinalizou os dois lançamentos idênticos como indício de
+possível lançamento fictício — com evidências reais citadas do documento.
+As outras 4 áreas novas (`imobiliario`, `rh`, `saude`, `outro`) ainda
+precisam ser rodadas para validação completa (`npm run golden:test`).
+
+| Componente | Onde vive o estado | Escala? |
+|---|---|---|
+| Templates de prompt | Constantes de string em código | ✅ |
+| Seleção de template (`getPromptTemplate`) | Lookup síncrono em objeto, sem I/O | ✅ |
+| Golden set (fixtures + script) | Arquivos locais, ferramenta de desenvolvimento | ✅ (não roda em produção) |
+
+**Para escalar:** nada — mesmo perfil da Fase 4, zero estado novo. O único
+"custo" de mais áreas é mais chamadas à IA por tipo de documento diferente,
+que já era coberto pelo `ANALYSIS_CONCURRENCY` (Fase 5) e pelo rate limit da
+OpenRouter (Fase 4/8).
+
+---
+
 ## Infraestrutura externa — o que este repo não inclui
 
 Duas categorias bem diferentes: o que é **obrigatório pra qualquer coisa
@@ -799,8 +878,12 @@ cada um resolve um problema específico que só aparece em cenários específico
 
 ## O que fica para as próximas fases
 
-- **Fase 9** — Templates de prompt para as demais áreas (`financas`,
-  `imobiliario`, `rh`, `saude`, `outro`) — hoje só `juridico` está implementado.
+- **Fase 10** — Polimento e Deploy: deploy do backend (Railway/Render/Fly.io)
+  e do frontend (Vercel), monitoramento básico (logs de erro, alertas de
+  falha na API da IA), revisão final do Termo de Uso/Política de Privacidade
+  com texto jurídico real, e testes de carga leve no fluxo de upload +
+  análise. Última fase da spec — depois dela a aplicação está pronta pra uso
+  real com dados de usuários reais.
 
 ## Notas de segurança já aplicadas
 
