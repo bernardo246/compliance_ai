@@ -4,6 +4,7 @@ import { ConfigModule } from '@nestjs/config';
 import { ThrottlerModule, ThrottlerGuard } from '@nestjs/throttler';
 import { ScheduleModule } from '@nestjs/schedule';
 import configuration from './config/configuration';
+import { RedisModule } from './common/redis/redis.module';
 import { SupabaseModule } from './common/supabase/supabase.module';
 import { JwtAuthGuard } from './common/guards/jwt-auth.guard';
 import { AuthModule } from './auth/auth.module';
@@ -23,6 +24,7 @@ import { HealthController } from './health.controller';
         limit: 30,
       },
     ]),
+    RedisModule,
     SupabaseModule,
     AuthModule,
     UsersModule,

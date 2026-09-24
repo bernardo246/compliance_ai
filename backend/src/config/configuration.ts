@@ -15,6 +15,11 @@ export default () => ({
     storageBucket: process.env.SUPABASE_STORAGE_BUCKET ?? 'documents',
   },
 
+  redis: {
+    // Fase 1 — estado compartilhado entre réplicas (rate limit, cache, fila).
+    url: process.env.REDIS_URL ?? 'redis://localhost:6379',
+  },
+
   jwt: {
     // As chaves ficam com \n escapados no .env; aqui convertemos de volta.
     privateKey: (process.env.JWT_PRIVATE_KEY ?? '').replace(/\\n/g, '\n'),
