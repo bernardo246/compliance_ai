@@ -1,7 +1,10 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { Cron, CronExpression } from '@nestjs/schedule';
+import { InjectQueue } from '@nestjs/bullmq';
+import { Queue } from 'bullmq';
 import { SupabaseService } from '../common/supabase/supabase.service';
+
+export const RETENCAO_QUEUE = 'retencao';
 
 export interface RetentionSweepResult {
   processados: number;
@@ -23,19 +26,33 @@ export interface RetentionSweepResult {
  * de pelo cron.
  */
 @Injectable()
-export class RetentionService {
+export class RetentionService implements OnModuleInit {
   private readonly logger = new Logger(RetentionService.name);
 
   constructor(
     private readonly supabase: SupabaseService,
     private readonly config: ConfigService,
+    @InjectQueue(RETENCAO_QUEUE) private readonly queue: Queue,
   ) {}
+
+  /**
+   * Fase 5 — agenda a varredura no Redis (BullMQ) em vez de @Cron em memória.
+   * `upsertJobScheduler` é idempotente: todas as réplicas registram o mesmo
+   * scheduler e o Redis mantém um só, então a cada hora UM job é criado e
+   * processado por UM worker — sem varredura duplicada por réplica.
+   */
+  async onModuleInit() {
+    await this.queue.upsertJobScheduler(
+      'retencao-horaria',
+      { pattern: '0 * * * *' },
+      { name: 'purgar', opts: { removeOnComplete: true, removeOnFail: true } },
+    );
+  }
 
   private db() {
     return this.supabase.getClient();
   }
 
-  @Cron(CronExpression.EVERY_HOUR)
   async purgeExpired(): Promise<RetentionSweepResult> {
     const bucket = this.config.get<string>('supabase.storageBucket')!;
     const nowIso = new Date().toISOString();

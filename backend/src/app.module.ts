@@ -5,7 +5,6 @@ import Redis from 'ioredis';
 import { BullModule } from '@nestjs/bullmq';
 import { ThrottlerStorageRedisService } from '@nest-lab/throttler-storage-redis';
 import { ThrottlerModule, ThrottlerGuard } from '@nestjs/throttler';
-import { ScheduleModule } from '@nestjs/schedule';
 import configuration from './config/configuration';
 import { RedisModule, REDIS_CLIENT } from './common/redis/redis.module';
 import { SupabaseModule } from './common/supabase/supabase.module';
@@ -20,7 +19,6 @@ import { DebugController } from './common/debug/debug.controller';
 @Module({
   imports: [
     ConfigModule.forRoot({ isGlobal: true, load: [configuration] }),
-    ScheduleModule.forRoot(), // Fase 7 — habilita @Cron() (RetentionService)
     RedisModule,
     ThrottlerModule.forRootAsync({
       inject: [REDIS_CLIENT],
