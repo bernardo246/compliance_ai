@@ -4,11 +4,11 @@
  * resultado final é consultável".
  *
  * Este script exercita o pipeline assíncrono de verdade (Storage + banco +
- * AnalysisRunnerService + OpenRouter), sem passar pelo HTTP/autenticação:
+ * AnalysisQueueService + OpenRouter), sem passar pelo HTTP/autenticação:
  *
  *   1. sobe um PDF do golden set para o Supabase Storage
  *   2. insere uma linha em `documents` com status 'uploaded'
- *   3. chama `AnalysisRunnerService.enqueue()` (fire-and-forget, igual ao upload)
+ *   3. chama `AnalysisQueueService.enqueue()` (fire-and-forget, igual ao upload)
  *   4. faz polling em `documents.status` até 'done' / 'error'
  *   5. imprime a linha de `analyses` resultante
  *   6. limpa tudo que criou (analyses, documents, objeto no Storage)
@@ -29,7 +29,7 @@ import { Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { AppModule } from '../src/app.module';
 import { SupabaseService } from '../src/common/supabase/supabase.service';
-import { AnalysisRunnerService } from '../src/analysis/analysis-runner.service';
+import { AnalysisQueueService } from '../src/analysis/analysis-queue.service';
 
 const FIXTURE = join(__dirname, '..', 'test-fixtures', 'juridico-contrato-com-problemas.pdf');
 const POLL_INTERVAL_MS = 3_000;
@@ -40,7 +40,7 @@ async function main() {
   const app = await NestFactory.createApplicationContext(AppModule, { bufferLogs: false });
 
   const supabase = app.get(SupabaseService).getClient();
-  const runner = app.get(AnalysisRunnerService);
+  const runner = app.get(AnalysisQueueService);
   const config = app.get(ConfigService);
   const bucket = config.get<string>('supabase.storageBucket')!;
 

@@ -6,7 +6,7 @@ import {
 import { ConfigService } from '@nestjs/config';
 import { randomUUID } from 'crypto';
 import { AnalysisReadService } from '../analysis/analysis-read.service';
-import { AnalysisRunnerService } from '../analysis/analysis-runner.service';
+import { AnalysisQueueService } from '../analysis/analysis-queue.service';
 import { SupabaseService } from '../common/supabase/supabase.service';
 import { AreaNegocio } from './dto/upload-document.dto';
 import { MIME_TO_TIPO } from './documents.types';
@@ -19,7 +19,7 @@ export class DocumentsService {
   constructor(
     private readonly supabase: SupabaseService,
     private readonly config: ConfigService,
-    private readonly analysisRunner: AnalysisRunnerService,
+    private readonly analysisQueue: AnalysisQueueService,
     private readonly analysisRead: AnalysisReadService,
     private readonly malwareScan: MalwareScanService,
   ) {}
@@ -138,7 +138,7 @@ export class DocumentsService {
     // a resposta do upload não espera a IA (que leva segundos a minutos).
     // O status do documento (uploaded → processing → done/error) é a fonte
     // de verdade do progresso.
-    this.analysisRunner.enqueue(document.id);
+    void this.analysisQueue.enqueue(document.id);
 
     return document;
   }

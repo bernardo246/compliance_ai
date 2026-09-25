@@ -1,7 +1,8 @@
 import { Module } from '@nestjs/common';
 import { APP_GUARD } from '@nestjs/core';
-import { ConfigModule } from '@nestjs/config';
+import { ConfigModule, ConfigService } from '@nestjs/config';
 import Redis from 'ioredis';
+import { BullModule } from '@nestjs/bullmq';
 import { ThrottlerStorageRedisService } from '@nest-lab/throttler-storage-redis';
 import { ThrottlerModule, ThrottlerGuard } from '@nestjs/throttler';
 import { ScheduleModule } from '@nestjs/schedule';
@@ -34,6 +35,14 @@ import { DebugController } from './common/debug/debug.controller';
           },
         ],
         storage: new ThrottlerStorageRedisService(redis),
+      }),
+    }),
+    BullModule.forRootAsync({
+      inject: [ConfigService],
+      useFactory: (config: ConfigService) => ({
+        // Fase 4 — BullMQ abre conexões próprias (Workers usam comandos
+        // bloqueantes e não podem dividir a conexão do cache/throttler).
+        connection: { url: config.get<string>('redis.url')! },
       }),
     }),
     SupabaseModule,
