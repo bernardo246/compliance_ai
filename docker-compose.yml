@@ -1,0 +1,46 @@
+# Fase 7 — ambiente local que simula múltiplas réplicas do backend
+# compartilhando um único Redis pela rede do Docker (não por localhost).
+#
+#   docker compose up -d --build        # sobe Redis + 3 réplicas
+#   docker compose up -d --scale backend=5   # muda o número de réplicas
+#   docker compose down                 # derruba tudo (o volume do Redis fica)
+#
+# Os segredos vêm de backend/.env (não versionado) e nunca entram na imagem.
+# O backend não publica porta no host: várias réplicas não podem ocupar a
+# mesma porta. A entrada externa é o load balancer (Fase 8).
+
+services:
+  redis:
+    image: redis:7-alpine
+    # AOF: a fila (BullMQ) sobrevive a um restart do Redis.
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  backend:
+    build: ./backend
+    image: compliance-backend:local
+    env_file: ./backend/.env
+    environment:
+      # Sobrescreve o REDIS_URL do .env (que aponta para localhost): dentro
+      # da rede do Compose, o Redis é alcançado pelo nome do serviço.
+      REDIS_URL: redis://redis:6379
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3001/api/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 15s
+    deploy:
+      replicas: 3
+
+volumes:
+  redis-data:
