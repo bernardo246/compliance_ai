@@ -14,6 +14,7 @@ import { UsersModule } from './users/users.module';
 import { DocumentsModule } from './documents/documents.module';
 import { AnalysisModule } from './analysis/analysis.module';
 import { HealthController } from './health.controller';
+import { DebugController } from './common/debug/debug.controller';
 
 @Module({
   imports: [
@@ -41,7 +42,7 @@ import { HealthController } from './health.controller';
     DocumentsModule,
     AnalysisModule,
   ],
-  controllers: [HealthController],
+  controllers: [HealthController, DebugController],
   providers: [
     { provide: APP_GUARD, useClass: ThrottlerGuard },
     { provide: APP_GUARD, useClass: JwtAuthGuard },

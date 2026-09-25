@@ -1,8 +1,10 @@
 import { Global, Logger, Module, OnApplicationShutdown, Inject } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import Redis from 'ioredis';
+import { REDIS_CLIENT } from './redis.constants';
+import { RedisCacheService } from './redis-cache.service';
 
-export const REDIS_CLIENT = Symbol('REDIS_CLIENT');
+export { REDIS_CLIENT };
 
 /**
  * Fase 1 — Cliente Redis compartilhado (fundação para rate limit, cache e fila).
@@ -24,8 +26,9 @@ export const REDIS_CLIENT = Symbol('REDIS_CLIENT');
         return client;
       },
     },
+    RedisCacheService,
   ],
-  exports: [REDIS_CLIENT],
+  exports: [REDIS_CLIENT, RedisCacheService],
 })
 export class RedisModule implements OnApplicationShutdown {
   constructor(@Inject(REDIS_CLIENT) private readonly client: Redis) {}
