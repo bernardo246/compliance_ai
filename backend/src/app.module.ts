@@ -1,10 +1,12 @@
 import { Module } from '@nestjs/common';
 import { APP_GUARD } from '@nestjs/core';
 import { ConfigModule } from '@nestjs/config';
+import Redis from 'ioredis';
+import { ThrottlerStorageRedisService } from '@nest-lab/throttler-storage-redis';
 import { ThrottlerModule, ThrottlerGuard } from '@nestjs/throttler';
 import { ScheduleModule } from '@nestjs/schedule';
 import configuration from './config/configuration';
-import { RedisModule } from './common/redis/redis.module';
+import { RedisModule, REDIS_CLIENT } from './common/redis/redis.module';
 import { SupabaseModule } from './common/supabase/supabase.module';
 import { JwtAuthGuard } from './common/guards/jwt-auth.guard';
 import { AuthModule } from './auth/auth.module';
@@ -17,14 +19,22 @@ import { HealthController } from './health.controller';
   imports: [
     ConfigModule.forRoot({ isGlobal: true, load: [configuration] }),
     ScheduleModule.forRoot(), // Fase 7 — habilita @Cron() (RetentionService)
-    ThrottlerModule.forRoot([
-      {
-        // Fase 0/8 — rate limit básico contra brute-force em login/registro.
-        ttl: 60_000,
-        limit: 30,
-      },
-    ]),
     RedisModule,
+    ThrottlerModule.forRootAsync({
+      inject: [REDIS_CLIENT],
+      useFactory: (redis: Redis) => ({
+        // Fase 2 — contadores no Redis (não na memória do Node): o limite
+        // vale globalmente, somando as requisições de todas as réplicas.
+        throttlers: [
+          {
+            // Fase 0/8 — rate limit básico contra brute-force em login/registro.
+            ttl: 60_000,
+            limit: 30,
+          },
+        ],
+        storage: new ThrottlerStorageRedisService(redis),
+      }),
+    }),
     SupabaseModule,
     AuthModule,
     UsersModule,
