@@ -1,0 +1,15 @@
+node_modules
+dist
+.env
+.env.*
+*.pem
+*.key
+.git
+.gitignore
+.DS_Store
+*.log
+scripts
+sql
+test-fixtures
+Dockerfile
+.dockerignore
