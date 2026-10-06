@@ -11,6 +11,9 @@
 *.key
 jwt-private.pem
 jwt-public.pem
+# Certificados TLS do Nginx de produção (chave privada!) — só o .gitkeep é versionado
+certs/*
+!certs/.gitkeep
 
 # ============================================================
 # Dependências

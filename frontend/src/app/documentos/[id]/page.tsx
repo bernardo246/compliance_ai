@@ -6,6 +6,7 @@ import Link from 'next/link';
 import { AlertTriangle, ArrowLeft, FileText, Loader2, ShieldAlert, Sparkles } from 'lucide-react';
 import { useAuth } from '@/lib/auth-context';
 import { apiJson } from '@/lib/api';
+import { pollDelayMs } from '@/lib/polling';
 import { Navbar } from '@/components/Navbar';
 import { StatusBadge } from '@/components/StatusBadge';
 import {
@@ -18,10 +19,9 @@ import {
   statusComplianceClasses,
 } from '@/lib/domain';
 
-// Mesmo intervalo do /upload — repolla enquanto o worker (Fase 5) não
-// terminar. É o "tela de status/polling" pedido no critério de pronto da
-// Fase 6.
-const POLL_INTERVAL_MS = 4000;
+// Repolla enquanto o worker (Fase 5) não terminar. É o "tela de status/polling"
+// pedido no critério de pronto da Fase 6. O intervalo cresce quanto mais a
+// análise demora (ver lib/polling.ts), para não pesar no banco.
 
 export default function DocumentDetailPage() {
   const { id } = useParams<{ id: string }>();
@@ -32,6 +32,7 @@ export default function DocumentDetailPage() {
   const [notFound, setNotFound] = useState(false);
   const [loadingDoc, setLoadingDoc] = useState(true);
   const pollRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pollAttemptRef = useRef(0);
 
   useEffect(() => {
     if (!loading) {
@@ -61,7 +62,10 @@ export default function DocumentDetailPage() {
 
   useEffect(() => {
     if (!doc || !isPendingStatus(doc.status)) return;
-    pollRef.current = setTimeout(() => void load(), POLL_INTERVAL_MS);
+    pollRef.current = setTimeout(() => {
+      pollAttemptRef.current += 1;
+      void load();
+    }, pollDelayMs(pollAttemptRef.current, document.hidden));
     return () => {
       if (pollRef.current) clearTimeout(pollRef.current);
     };

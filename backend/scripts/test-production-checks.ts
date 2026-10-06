@@ -15,6 +15,7 @@ const OK_ENV: Record<string, string> = {
   REDIS_URL: 'rediss://default:senha@redis.exemplo.com:6380',
   FRONTEND_URL: 'https://app.exemplo.com',
   TRUST_PROXY: 'true',
+  ALERT_WEBHOOK_URL: 'https://hooks.exemplo.com/abc',
 };
 
 const resultados: boolean[] = [];
@@ -65,6 +66,8 @@ for (const nome of ['SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY', 'JWT_PRIVATE_KE
   check('FRONTEND_URL http é aviso (cookie secure)', http.errors.length === 0 && tem(http.warnings, 'FRONTEND_URL'));
   const proxy = checkProductionConfig(com({ TRUST_PROXY: 'false' }));
   check('TRUST_PROXY desligado é aviso', proxy.errors.length === 0 && tem(proxy.warnings, 'TRUST_PROXY'));
+  const semAlerta = checkProductionConfig(com({ ALERT_WEBHOOK_URL: '' }));
+  check('sem ALERT_WEBHOOK_URL é só aviso (os alertas ficariam só no log)', semAlerta.errors.length === 0 && tem(semAlerta.warnings, 'ALERT_WEBHOOK_URL'));
   const dbg = checkProductionConfig(com({ ENABLE_DEBUG_ENDPOINT: 'true' }));
   check('endpoint de debug ligado é aviso', dbg.errors.length === 0 && tem(dbg.warnings, 'ENABLE_DEBUG_ENDPOINT'));
 }

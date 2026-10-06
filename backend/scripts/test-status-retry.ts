@@ -31,13 +31,18 @@ class FakeDb {
     return [...this.rows.values()].filter((r) => filters.every((f) => f(r)));
   }
 
-  private builder(run: (rows: Row[]) => any, filters: Array<(r: Row) => boolean> = []) {
+  private builder(
+    run: (rows: Row[], state: { wantRows: boolean }) => any,
+    filters: Array<(r: Row) => boolean> = [],
+    state = { wantRows: false },
+  ) {
     const b: any = {
-      eq: (c: string, v: unknown) => this.builder(run, [...filters, (r) => r[c] === v]),
-      is: (c: string, v: unknown) => this.builder(run, [...filters, (r) => (r[c] ?? null) === v]),
-      in: (c: string, vs: unknown[]) => this.builder(run, [...filters, (r) => vs.includes(r[c])]),
+      eq: (c: string, v: unknown) => this.builder(run, [...filters, (r) => r[c] === v], state),
+      is: (c: string, v: unknown) => this.builder(run, [...filters, (r) => (r[c] ?? null) === v], state),
+      in: (c: string, vs: unknown[]) => this.builder(run, [...filters, (r) => vs.includes(r[c])], state),
+      select: () => this.builder(run, filters, { wantRows: true }),
       maybeSingle: async () => ({ data: this.filter(filters)[0] ?? null, error: null }),
-      then: (res: any, rej: any) => Promise.resolve(run(this.filter(filters))).then(res, rej),
+      then: (res: any, rej: any) => Promise.resolve(run(this.filter(filters), state)).then(res, rej),
     };
     return b;
   }
@@ -49,7 +54,7 @@ class FakeDb {
         return {
           select: () => this.builder((rows) => ({ data: rows, error: null })),
           update: (patch: Row) =>
-            this.builder((rows) => {
+            this.builder((rows, state) => {
               const key = String(patch.status ?? '');
               this.updateAttempts[key] = (this.updateAttempts[key] ?? 0) + 1;
               const restantes = this.failStatusWrites[key] ?? 0;
@@ -58,7 +63,7 @@ class FakeDb {
                 return { error: { message: 'TypeError: fetch failed' } };
               }
               rows.forEach((r) => Object.assign(r, patch));
-              return { error: null };
+              return { data: state.wantRows ? rows.map((r) => ({ id: r.id })) : undefined, error: null };
             }),
         };
       },
@@ -84,7 +89,8 @@ const outcomeOk = {
 };
 
 function makeProcessor(db: FakeDb, analyze: () => Promise<any>, recover = async (..._a: unknown[]) => {}) {
-  const p = new AnalysisProcessor(db as any, config as any, { analyze } as any, { recoverPending: recover } as any);
+  const redisFalso = { set: async () => 'OK', incr: async () => 1, expire: async () => 1 };
+  const p = new AnalysisProcessor(db as any, config as any, { analyze } as any, { recoverPending: recover } as any, redisFalso as any);
   (p as any).retryBaseMs = 1; // tentativas em milissegundos no teste
   return p;
 }
@@ -168,6 +174,70 @@ async function main() {
     let ok = true;
     try { await p.onJobFailed(undefined, new Error('x')); } catch { ok = false; }
     check('handler de "failed" sem job não lança', ok);
+  }
+
+  // 6. reivindicação condicional do documento (claimForProcessing)
+  {
+    const claim = async (status: string, extra: Row = {}, failProcessing = 0) => {
+      const db = new FakeDb();
+      db.add({ id: 'c', status, created_at: minAgo(5), ...extra });
+      db.failStatusWrites['processing'] = failProcessing;
+      const p = makeProcessor(db, async () => outcomeOk);
+      const ganhou = await (p as any).claimForProcessing('c');
+      return { ganhou, status: db.rows.get('c')!.status, tentativas: db.updateAttempts['processing'] ?? 0 };
+    }
+    for (const st of ['uploaded', 'processing']) {
+      const r = await claim(st);
+      check(`reivindica documento "${st}"`, r.ganhou && r.status === 'processing', `status depois=${r.status}`);
+    }
+    const erro = await claim('error');
+    check('NÃO reivindica documento "error" (estado final: nada o reanalisa)', !erro.ganhou && erro.status === 'error', `status depois=${erro.status}`);
+    const done = await claim('done');
+    check('NÃO reivindica (nem sobrescreve) documento "done"', !done.ganhou && done.status === 'done', `status depois=${done.status}`);
+    const excluido = await claim('uploaded', { deletado_em: minAgo(1) });
+    check('NÃO reivindica documento excluído', !excluido.ganhou && excluido.status === 'uploaded');
+    const retry = await claim('uploaded', {}, 2);
+    check('banco falhando 2x: a reivindicação tenta de novo e consegue', retry.ganhou && retry.tentativas === 3, `tentativas=${retry.tentativas}`);
+    const sempre = await claim('uploaded', {}, Number.POSITIVE_INFINITY);
+    check('banco fora o tempo todo: não reivindica e não lança', !sempre.ganhou && sempre.status === 'uploaded');
+  }
+
+  // 7. a janela real: o documento vira 'done' entre a leitura e a reivindicação
+  {
+    const db = new FakeDb();
+    db.add({ id: 'w', status: 'uploaded', created_at: minAgo(5) });
+    let chamouIA = false;
+    const p = makeProcessor(db, async () => { chamouIA = true; return outcomeOk; });
+    const original = (p as any).loadDocument.bind(p);
+    (p as any).loadDocument = async (id: string) => {
+      const doc = await original(id);
+      db.rows.get(id)!.status = 'done'; // outro worker conclui logo depois da leitura
+      return doc;
+    };
+    await p.process(job('w'));
+    check('documento concluído por outro worker entre a leitura e a reivindicação: este job não chama a IA', !chamouIA);
+    check('...e o status "done" não é sobrescrito por "processing"', db.rows.get('w')!.status === 'done', `status=${db.rows.get('w')!.status}`);
+  }
+
+  // 8. 'error' é terminal e um erro tardio nunca sobrescreve 'done'
+  {
+    const db = new FakeDb();
+    db.add({ id: 'e1', status: 'error', created_at: minAgo(5), erro: 'falhou antes' });
+    let chamouIA = false;
+    const p = makeProcessor(db, async () => { chamouIA = true; return outcomeOk; });
+    await p.process(job('e1'));
+    check('job tardio para um documento em "error": não chama a IA nem o reanalisa', !chamouIA && db.rows.get('e1')!.status === 'error');
+  }
+  {
+    // worker "zumbi": falha DEPOIS de outro worker ter concluído o mesmo documento
+    const db = new FakeDb();
+    db.add({ id: 'z1', status: 'uploaded', created_at: minAgo(5) });
+    const p = makeProcessor(db, async () => {
+      db.rows.get('z1')!.status = 'done'; // o outro worker conclui enquanto este ainda analisa
+      throw new Error('IA fora do ar (worker zumbi)');
+    });
+    await p.process(job('z1'));
+    check('erro de um worker zumbi NÃO sobrescreve o "done" gravado por outro', db.rows.get('z1')!.status === 'done', `status=${db.rows.get('z1')!.status}`);
   }
 
   const ok = resultados.every(Boolean);

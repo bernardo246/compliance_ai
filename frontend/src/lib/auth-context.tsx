@@ -1,7 +1,7 @@
 'use client';
 
 import { createContext, useCallback, useContext, useEffect, useState } from 'react';
-import { apiJson, setAccessToken } from './api';
+import { apiJson, refreshAccessToken, setAccessToken } from './api';
 
 export interface User {
   id: string;
@@ -39,11 +39,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     // Ao carregar a app, tenta usar o refresh cookie para obter sessão.
     (async () => {
       try {
-        const { accessToken } = await apiJson<{ accessToken: string }>('/api/auth/refresh', {
-          method: 'POST',
-        });
-        setAccessToken(accessToken);
-        await refreshProfile();
+        const token = await refreshAccessToken();
+        if (token) {
+          await refreshProfile();
+        } else {
+          setAccessToken(null);
+        }
       } catch {
         setAccessToken(null);
       } finally {

@@ -1,33 +1,71 @@
-# Modelo de PRODUÇÃO — roda só o backend, contra um Redis GERENCIADO (rediss://)
-# e o Supabase. Sem Redis e sem Nginx aqui: em produção o Redis é um serviço do
-# provedor e o load balancer também.
+# PRODUÇÃO — o que roda na VM. Segue a arquitetura de docs/arquitetura-producao.svg:
 #
-# Serve para (1) testar a imagem de produção na sua máquina antes do deploy e
-# (2) como referência das opções (a maioria dos provedores — Railway, Render,
-# Fly.io — roda a imagem direto, sem Compose, com as variáveis no painel).
+#   internet ──HTTPS──► nginx ──► backend (N réplicas) ──► Redis gerenciado (REDIS_URL)
+#                                                      └──► Supabase, OpenRouter
 #
-#   cp backend/.env.production.example backend/.env.production   # e preencha
-#   docker compose -f docker-compose.prod.yml up -d --build
+# O Redis NÃO está neste arquivo: em produção ele é um serviço gerenciado,
+# separado da VM (rede privada, TLS e senha); o backend o alcança pelo
+# REDIS_URL do .env.production. O banco e os arquivos ficam no Supabase.
 #
-# Para usar uma imagem já publicada no registry em vez de buildar:
+# Antes de subir:
+#   1. cp backend/.env.production.example backend/.env.production   # e preencha
+#   2. coloque o certificado do domínio em ./certs (fullchain.pem e privkey.pem)
+#   3. docker compose -f docker-compose.prod.yml up -d --build
+#
+# Número de réplicas do backend (padrão 2):
+#   BACKEND_REPLICAS=3 docker compose -f docker-compose.prod.yml up -d --build
+#
+# Para usar uma imagem já publicada em um registry em vez de buildar na VM:
 #   BACKEND_IMAGE=registry.exemplo.com/compliance-backend:1.0.0 \
 #     docker compose -f docker-compose.prod.yml up -d --no-build
+#
+# Faça o build NA VM (ou com --platform linux/amd64): uma imagem construída em
+# um Mac com chip Apple é arm64 e não roda em uma VM x86.
 
 services:
   backend:
     build: ./backend
     image: ${BACKEND_IMAGE:-compliance-backend:prod}
     env_file: ./backend/.env.production
+    environment:
+      # Atrás do Nginx: req.ip (rate limit e auditoria) vem do X-Forwarded-For.
+      TRUST_PROXY: "true"
+      # Nunca ligado em produção.
+      ENABLE_DEBUG_ENDPOINT: "false"
+      # Se o Redis gerenciado usar uma CA própria (não pública), descomente estas
+      # duas linhas e a de `volumes`, e coloque o certificado em ./certs/redis-ca.pem:
+      # NODE_EXTRA_CA_CERTS: /certs/redis-ca.pem
+    # volumes:
+    #   - ./certs/redis-ca.pem:/certs/redis-ca.pem:ro
     restart: unless-stopped
-    # Só em localhost: quem expõe o serviço ao mundo é o load balancer do provedor.
-    ports:
-      - "127.0.0.1:3001:3001"
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:3001/api/health"]
       interval: 15s
       timeout: 3s
       retries: 5
       start_period: 20s
-    # Limites de recurso: o upload bufferiza o arquivo em memória (até 20 MB).
+    deploy:
+      replicas: ${BACKEND_REPLICAS:-2}
+    # O upload bufferiza o arquivo em memória (até 20 MB): dimensione por réplica.
     mem_limit: 768m
     cpus: 1.0
+
+  nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    volumes:
+      - ./nginx/nginx.prod.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./certs:/etc/nginx/certs:ro
+    ports:
+      - "80:80"
+      - "443:443"
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      # 127.0.0.1 e não localhost: no container, localhost resolve para ::1 (IPv6)
+      # e o Nginx só escuta em IPv4.
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/nginx-health"]
+      interval: 15s
+      timeout: 3s
+      retries: 5

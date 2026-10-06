@@ -20,6 +20,11 @@ export { REDIS_CLIENT };
         const logger = new Logger('Redis');
         const client = new Redis(config.get<string>('redis.url')!, {
           maxRetriesPerRequest: null, // exigido por BullMQ nas fases seguintes
+          // Cliente do rate limit e do cache (o BullMQ abre conexões próprias):
+          // com o Redis fora, os comandos FALHAM NA HORA em vez de ficarem
+          // enfileirados esperando a volta (a requisição não trava e a memória
+          // não enche de comandos pendentes). Quem usa trata o erro e degrada.
+          enableOfflineQueue: false,
         });
         client.on('connect', () => logger.log('Conectado ao Redis'));
         client.on('error', (err) => logger.error(`Erro no Redis: ${err.message}`));

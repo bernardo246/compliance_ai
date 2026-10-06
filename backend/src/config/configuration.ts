@@ -16,6 +16,19 @@ export default () => ({
     enabled: process.env.ENABLE_DEBUG_ENDPOINT === 'true',
   },
 
+  // Alertas de monitoramento (src/monitoring): um job periódico avalia regras
+  // (documentos parados, fila acumulada, taxa de erro da IA, jobs falhos, rotinas
+  // paradas, banco inacessível) e avisa por webhook. Sem ALERT_WEBHOOK_URL os
+  // alertas só aparecem no log.
+  monitoring: {
+    webhookUrl: process.env.ALERT_WEBHOOK_URL ?? '',
+    // slack (campo `text`), discord (campo `content`) ou generic (JSON completo)
+    webhookFormat: process.env.ALERT_WEBHOOK_FORMAT ?? 'slack',
+    intervalMs: parseInt(process.env.ALERT_CHECK_INTERVAL_MS ?? '60000', 10),
+    // Um alerta que continua disparado é repetido só depois deste tempo (lembrete).
+    cooldownMs: parseInt(process.env.ALERT_COOLDOWN_MS ?? '1800000', 10),
+  },
+
   supabase: {
     url: process.env.SUPABASE_URL ?? '',
     serviceRoleKey: process.env.SUPABASE_SERVICE_ROLE_KEY ?? '',

@@ -71,6 +71,12 @@ export function checkProductionConfig(
     );
   }
 
+  if (blank(env.ALERT_WEBHOOK_URL)) {
+    warnings.push(
+      'ALERT_WEBHOOK_URL não está definida: os alertas de monitoramento (documentos parados, taxa de erro da IA, fila acumulada...) só vão para o log, e ninguém é avisado.',
+    );
+  }
+
   if (env.ENABLE_DEBUG_ENDPOINT === 'true') {
     warnings.push(
       'ENABLE_DEBUG_ENDPOINT=true: /api/debug/instance está ligado, público e fora do rate limit. Desligue em produção.',

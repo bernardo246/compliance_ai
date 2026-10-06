@@ -1,8 +1,11 @@
-import { Logger } from '@nestjs/common';
+import { Inject, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { OnWorkerEvent, Processor, WorkerHost } from '@nestjs/bullmq';
 import { Job } from 'bullmq';
+import Redis from 'ioredis';
+import { REDIS_CLIENT } from '../common/redis/redis.constants';
 import { SupabaseService } from '../common/supabase/supabase.service';
+import { HEARTBEAT_VARREDURA, contarJobFalho, registrarBatimento } from '../monitoring/monitoring.keys';
 import { AreaNegocio } from '../documents/dto/upload-document.dto';
 import { TipoDocumento } from '../documents/documents.types';
 import { AnalysisService } from './analysis.service';
@@ -41,6 +44,7 @@ export class AnalysisProcessor extends WorkerHost {
     private readonly config: ConfigService,
     private readonly analysisService: AnalysisService,
     private readonly queueService: AnalysisQueueService,
+    @Inject(REDIS_CLIENT) private readonly redis: Redis,
   ) {
     super();
   }
@@ -59,6 +63,7 @@ export class AnalysisProcessor extends WorkerHost {
       // AnalysisQueueService): rede de segurança para quando uma gravação de
       // status falhou e nenhum job ficou para trás.
       await this.queueService.recoverPending(RECUPERAR_UPLOADED_MIN_AGE_MS, 'varredura periódica');
+      await registrarBatimento(this.redis, HEARTBEAT_VARREDURA);
       return;
     }
     await this.run(job.data.documentId);
@@ -79,13 +84,14 @@ export class AnalysisProcessor extends WorkerHost {
     this.logger.error(
       `Job de análise do documento ${documentId} falhou definitivamente: ${err.message}`,
     );
+    await contarJobFalho(this.redis);
     await this.updateDocument(
       documentId,
       {
         status: 'error',
         erro: 'A análise foi interrompida por uma falha no servidor antes de terminar. Envie o documento novamente.',
       },
-      ['uploaded', 'processing'],
+      { onlyIfStatus: ['uploaded', 'processing'] },
     );
   }
 
@@ -93,10 +99,17 @@ export class AnalysisProcessor extends WorkerHost {
     const doc = await this.loadDocument(documentId);
     if (!doc) return;
 
-    await this.setStatus(documentId, 'processing', {
-      processing_started_at: new Date().toISOString(),
-      erro: null,
-    });
+    // Reivindica o documento de forma ATÔMICA: a checagem do loadDocument e esta
+    // gravação são dois passos, e entre eles o documento pode ter sido concluído
+    // por outro worker ou excluído pelo usuário. O UPDATE condicional só pega
+    // documentos ainda analisáveis; se não alterou nenhuma linha, outro já
+    // cuidou dele e este job para aqui, sem chamar a IA.
+    if (!(await this.claimForProcessing(documentId))) {
+      this.logger.log(
+        `Documento ${documentId} não pôde ser reivindicado (já concluído, excluído ou banco indisponível) — análise ignorada.`,
+      );
+      return;
+    }
 
     try {
       const buffer = await this.downloadFromStorage(doc.storage_path!);
@@ -136,7 +149,13 @@ export class AnalysisProcessor extends WorkerHost {
     } catch (err) {
       const mensagem = err instanceof Error ? err.message : String(err);
       this.logger.warn(`Análise do documento ${documentId} falhou: ${mensagem}`);
-      await this.setStatus(documentId, 'error', { erro: mensagem.slice(0, 500) });
+      // Só se o documento ainda estiver em andamento: se outro worker (ex.: o que
+      // assumiu depois que este travou) já o concluiu, o 'done' não é sobrescrito.
+      await this.updateDocument(
+        documentId,
+        { status: 'error', erro: mensagem.slice(0, 500) },
+        { onlyIfStatus: ['uploaded', 'processing'] },
+      );
     }
   }
 
@@ -159,8 +178,10 @@ export class AnalysisProcessor extends WorkerHost {
       this.logger.log(`Documento ${documentId} já foi excluído — análise ignorada.`);
       return null;
     }
-    if (data.status === 'done') {
-      // Já analisado (ex.: enqueue duplicado). Nada a fazer.
+    if (data.status === 'done' || data.status === 'error') {
+      // Estados finais: 'done' (já analisado, ex.: enqueue duplicado) e 'error'
+      // (falhou de vez; o usuário reenvia o documento — nada reenfileira um
+      // documento em 'error', e um job tardio para ele não o reanalisa).
       return null;
     }
     return data;
@@ -186,6 +207,15 @@ export class AnalysisProcessor extends WorkerHost {
     await this.updateDocument(documentId, { status, ...extra });
   }
 
+  private async claimForProcessing(documentId: string): Promise<boolean> {
+    const { ok, updated } = await this.updateDocument(
+      documentId,
+      { status: 'processing', processing_started_at: new Date().toISOString(), erro: null },
+      { onlyIfStatus: ['uploaded', 'processing'], notDeleted: true },
+    );
+    return ok && updated > 0;
+  }
+
   /**
    * Grava em `documents` com algumas tentativas: o banco pode ficar fora do ar
    * por instantes, e estas gravações são o que tira o documento de
@@ -193,21 +223,23 @@ export class AnalysisProcessor extends WorkerHost {
    * termina e a varredura periódica (RECUPERAR_JOB) reenfileira o documento
    * quando ele passar de ANALYSIS_STUCK_TIMEOUT_MS parado.
    * `onlyIfStatus` restringe a gravação a documentos ainda nesses estados
-   * (para nunca sobrescrever um 'done').
+   * (para nunca sobrescrever um 'done') e `notDeleted` a documentos não
+   * excluídos. `updated` é quantas linhas a gravação realmente alterou.
    */
   private async updateDocument(
     documentId: string,
     patch: Record<string, unknown>,
-    onlyIfStatus?: string[],
-  ): Promise<boolean> {
+    options: { onlyIfStatus?: string[]; notDeleted?: boolean } = {},
+  ): Promise<{ ok: boolean; updated: number }> {
     const maxTentativas = 3;
     let ultimoErro = '';
     for (let tentativa = 1; tentativa <= maxTentativas; tentativa++) {
       try {
         let query = this.db().from('documents').update(patch).eq('id', documentId);
-        if (onlyIfStatus) query = query.in('status', onlyIfStatus);
-        const { error } = await query;
-        if (!error) return true;
+        if (options.onlyIfStatus) query = query.in('status', options.onlyIfStatus);
+        if (options.notDeleted) query = query.is('deletado_em', null);
+        const { data, error } = await query.select('id');
+        if (!error) return { ok: true, updated: data?.length ?? 0 };
         ultimoErro = error.message;
       } catch (e) {
         ultimoErro = e instanceof Error ? e.message : String(e);
@@ -221,6 +253,6 @@ export class AnalysisProcessor extends WorkerHost {
         patch.status ?? Object.keys(patch),
       )}) após ${maxTentativas} tentativas: ${ultimoErro}`,
     );
-    return false;
+    return { ok: false, updated: 0 };
   }
 }

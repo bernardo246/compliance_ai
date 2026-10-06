@@ -1,6 +1,7 @@
 import {
   ConflictException,
   Injectable,
+  InternalServerErrorException,
   UnauthorizedException,
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
@@ -112,6 +113,11 @@ export class AuthService {
       .select('id, email, role')
       .single();
 
+    if (error?.code === '23505') {
+      // O e-mail é único no banco: duas requisições simultâneas passam pela
+      // leitura "já existe?" acima, e a segunda inserção é recusada aqui.
+      throw new ConflictException('Já existe uma conta com este e-mail.');
+    }
     if (error || !user) {
       throw new Error(`Falha ao criar usuário: ${error?.message}`);
     }
@@ -155,9 +161,16 @@ export class AuthService {
   }
 
   /**
-   * Refresh token rotation: o token recebido é invalidado e um novo par
-   * (access + refresh) é emitido. Se o token já tiver sido usado/revogado,
-   * tratamos como possível reuso de token vazado e revogamos toda a família.
+   * Refresh token rotation: o token recebido é de USO ÚNICO. Ele é invalidado e
+   * um novo par (access + refresh) é emitido. Se o token já tiver sido
+   * usado/revogado, tratamos como possível reuso de token vazado e revogamos
+   * toda a família de refresh tokens do usuário.
+   *
+   * A revogação é uma reivindicação ATÔMICA (UPDATE ... WHERE revoked = false):
+   * com várias requisições simultâneas usando o mesmo token (várias réplicas,
+   * ou um atacante com o token roubado ao mesmo tempo que o dono), só UMA
+   * consegue marcá-lo; as demais caem no caminho de reuso. Ler o token e
+   * revogá-lo em dois passos deixava várias passarem e emitirem tokens novos.
    */
   async refresh(refreshToken: string, ip?: string) {
     const tokenHash = this.hashRefreshToken(refreshToken);
@@ -173,24 +186,25 @@ export class AuthService {
     }
 
     if (stored.revoked || new Date(stored.expires_at) < new Date()) {
-      // Reuso de token já revogado (ou expirado) — indício de token vazado/
-      // roubado sendo reaproveitado. Evento de segurança: logado explicitamente,
-      // e por segurança revoga toda a família de refresh tokens do usuário.
-      const jaEraRevogado = stored.revoked;
-      await this.db()
-        .from('refresh_tokens')
-        .update({ revoked: true })
-        .eq('user_id', stored.user_id);
-      if (jaEraRevogado) {
-        await this.logAudit(stored.user_id, 'refresh_token_reuse_detected', ip);
-      }
-      throw new UnauthorizedException('Refresh token expirado ou já utilizado. Faça login novamente.');
+      await this.handleRefreshTokenReuse(stored.user_id, stored.revoked, ip);
     }
 
-    await this.db()
+    const { data: claimed, error: claimError } = await this.db()
       .from('refresh_tokens')
       .update({ revoked: true })
-      .eq('id', stored.id);
+      .eq('id', stored.id)
+      .eq('revoked', false)
+      .gt('expires_at', new Date().toISOString())
+      .select('id');
+
+    if (claimError) {
+      throw new InternalServerErrorException('Falha ao renovar a sessão.');
+    }
+    if (!claimed || claimed.length === 0) {
+      // Outra requisição reivindicou (ou o token foi revogado) entre a leitura
+      // e esta atualização: é reuso do mesmo token.
+      await this.handleRefreshTokenReuse(stored.user_id, true, ip);
+    }
 
     const { data: user } = await this.db()
       .from('users')
@@ -203,6 +217,23 @@ export class AuthService {
     }
 
     return this.signTokens(user);
+  }
+
+  /**
+   * Reuso de token já revogado (ou expirado) — indício de token vazado/roubado
+   * sendo reaproveitado. Evento de segurança: logado explicitamente, e por
+   * segurança revoga toda a família de refresh tokens do usuário. Sempre lança.
+   */
+  private async handleRefreshTokenReuse(
+    userId: string,
+    jaEraRevogado: boolean,
+    ip?: string,
+  ): Promise<never> {
+    await this.db().from('refresh_tokens').update({ revoked: true }).eq('user_id', userId);
+    if (jaEraRevogado) {
+      await this.logAudit(userId, 'refresh_token_reuse_detected', ip);
+    }
+    throw new UnauthorizedException('Refresh token expirado ou já utilizado. Faça login novamente.');
   }
 
   async logout(refreshToken: string, ip?: string) {

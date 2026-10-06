@@ -18,6 +18,11 @@
     "retention:test": "TS_NODE_FILES=true ts-node scripts/test-retention.ts",
     "status-retry:test": "TS_NODE_FILES=true ts-node scripts/test-status-retry.ts",
     "prod-checks:test": "TS_NODE_FILES=true ts-node scripts/test-production-checks.ts",
+    "frontend-refresh:test": "TS_NODE_FILES=true ts-node scripts/test-frontend-single-flight.ts",
+    "db-load:test": "TS_NODE_FILES=true ts-node scripts/test-db-load.ts",
+    "multi-tab:test": "TS_NODE_FILES=true ts-node scripts/test-multi-tab-refresh.ts",
+    "alerts:test": "TS_NODE_FILES=true ts-node scripts/test-alerts.ts",
+    "throttler-resilient:test": "TS_NODE_FILES=true ts-node scripts/test-resilient-throttler.ts",
     "malware-scan:test": "TS_NODE_FILES=true ts-node scripts/test-malware-scan.ts",
     "security:test": "TS_NODE_FILES=true ts-node scripts/test-security.ts"
   },

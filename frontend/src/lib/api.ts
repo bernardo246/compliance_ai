@@ -17,7 +17,26 @@ interface ApiError {
   message: string | string[];
 }
 
-async function refreshAccessToken(): Promise<string | null> {
+// O refresh token é de USO ÚNICO no backend: duas renovações simultâneas com o
+// mesmo cookie fazem a segunda ser tratada como reuso (e derrubam a sessão).
+// Dois níveis de proteção:
+//  1. Na MESMA aba só existe UMA renovação em andamento por vez: quem chegar
+//     enquanto ela corre (várias chamadas com 401 ao mesmo tempo, o efeito
+//     duplicado do StrictMode) espera e usa o mesmo resultado.
+//  2. Entre ABAS do mesmo navegador (que dividem o cookie) as renovações se
+//     revezam por um lock (Web Locks API): a aba que espera só envia a sua
+//     requisição depois que a outra terminou, já com o cookie novo.
+let refreshInFlight: Promise<string | null> | null = null;
+
+const REFRESH_LOCK_NAME = 'compliance-refresh-token';
+
+function withRefreshLock<T>(fn: () => Promise<T>): Promise<T> {
+  const locks = typeof navigator !== 'undefined' ? navigator.locks : undefined;
+  // Navegador sem Web Locks: segue só com a proteção da própria aba.
+  return locks ? (locks.request(REFRESH_LOCK_NAME, fn) as Promise<T>) : fn();
+}
+
+async function doRefresh(): Promise<string | null> {
   const res = await fetch(`${API_URL}/api/auth/refresh`, {
     method: 'POST',
     credentials: 'include',
@@ -25,7 +44,18 @@ async function refreshAccessToken(): Promise<string | null> {
   if (!res.ok) return null;
   const data = await res.json();
   setAccessToken(data.accessToken);
-  return data.accessToken;
+  return data.accessToken as string;
+}
+
+export function refreshAccessToken(): Promise<string | null> {
+  if (!refreshInFlight) {
+    refreshInFlight = withRefreshLock(doRefresh)
+      .catch(() => null)
+      .finally(() => {
+        refreshInFlight = null;
+      });
+  }
+  return refreshInFlight;
 }
 
 export async function apiFetch(path: string, init: RequestInit = {}): Promise<Response> {

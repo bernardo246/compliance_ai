@@ -9,11 +9,11 @@ import { apiFetch, apiJson } from '@/lib/api';
 import { Navbar } from '@/components/Navbar';
 import { StatusBadge } from '@/components/StatusBadge';
 import { AREAS, areaLabel, DocumentItem, isPendingStatus } from '@/lib/domain';
+import { pollDelayMs } from '@/lib/polling';
 
 // Enquanto algum documento estiver uploaded/processing, a lista é
 // atualizada nesse intervalo — é o "polling" da Fase 6 (critério de pronto:
 // ver o status mudar sem tocar em código / sem dar F5 manual).
-const POLL_INTERVAL_MS = 4000;
 
 export default function UploadPage() {
   const { user, loading } = useAuth();
@@ -56,15 +56,22 @@ export default function UploadPage() {
   // Fase 6 — enquanto houver documento em 'uploaded'/'processing', repolla a
   // lista periodicamente para o rótulo de status virar 'Concluído'/'Erro'
   // sozinho (sem o usuário precisar dar F5).
+  // O intervalo cresce quanto mais o documento demora (ver lib/polling.ts) para
+  // não pesar no banco com muitos usuários esperando; volta a 4 s a cada upload novo.
   const pollRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pollAttemptRef = useRef(0);
   useEffect(() => {
     if (!user?.terms_accepted) return;
     const hasPending = documents.some((doc) => isPendingStatus(doc.status));
-    if (!hasPending) return;
+    if (!hasPending) {
+      pollAttemptRef.current = 0;
+      return;
+    }
 
     pollRef.current = setTimeout(() => {
+      pollAttemptRef.current += 1;
       void loadDocuments();
-    }, POLL_INTERVAL_MS);
+    }, pollDelayMs(pollAttemptRef.current, document.hidden));
 
     return () => {
       if (pollRef.current) clearTimeout(pollRef.current);
@@ -99,6 +106,7 @@ export default function UploadPage() {
         throw new Error(body?.message ?? 'Falha ao enviar o documento.');
       }
       setFile(null);
+      pollAttemptRef.current = 0;
       await loadDocuments();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Falha ao enviar o documento.');

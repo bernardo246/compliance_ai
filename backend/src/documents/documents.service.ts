@@ -182,16 +182,22 @@ export class DocumentsService {
       await this.db().storage.from(bucket).remove([document.storage_path]);
     }
 
-    const { error } = await this.db()
+    // Condicional (só se ainda não excluído): duas exclusões simultâneas não
+    // sobrescrevem `deletado_em` nem geram dois registros de auditoria.
+    const { data: atualizados, error } = await this.db()
       .from('documents')
       .update({ storage_path: null, deletado_em: new Date().toISOString() })
-      .eq('id', documentId);
+      .eq('id', documentId)
+      .is('deletado_em', null)
+      .select('id');
 
     if (error) {
       throw new BadRequestException(`Falha ao excluir documento: ${error.message}`);
     }
 
-    await this.logAudit(userId, 'delete_document', ip);
+    if (atualizados && atualizados.length > 0) {
+      await this.logAudit(userId, 'delete_document', ip);
+    }
     return { success: true };
   }
 

@@ -76,6 +76,7 @@ projeto-analise-ia/
 │   │   ├── auth/          # Fase 1-2 (Fase 8: rate limit dedicado + logs de auditoria)
 │   │   ├── common/redis/  # Escalabilidade — cliente Redis compartilhado + cache
 │   │   ├── common/debug/  # Escalabilidade — endpoint de diagnóstico (instância + contador + IP)
+│   │   ├── monitoring/    # Alertas de monitoramento (regras + webhook) e batimentos das rotinas
 │   │   ├── documents/     # Fase 3 (upload) + retention.service/processor (Fase 7, BullMQ)
 │   │   │   └── security/  # Fase 8 — malware-scan.service.ts, pdf-heuristics.ts, clamav.client.ts
 │   │   └── analysis/      # Fase 4-5 — extração, analysis-queue.service + analysis.processor (BullMQ), schema; prompts/ tem as 6 áreas (Fase 4 + 9)
@@ -83,11 +84,14 @@ projeto-analise-ia/
 │   ├── scripts/           # golden set (F4/F9) + pipeline (F5) + retenção (F7) + malware/segurança (F8)
 │   │                      # + testes de escalabilidade: queue-race, double-stall, e2e-http, load-balancer
 │   ├── test-fixtures/     # 12 PDFs de teste (2 por área) com problemas conhecidos injetados
-│   └── sql/               # 001_init + 002_analysis_pipeline + 003_retention.sql (rodar no Supabase, em ordem)
-├── nginx/nginx.conf        # Escalabilidade — load balancer na frente das réplicas
+│   └── sql/               # 001_init + 002_analysis_pipeline + 003_retention + 004_scale_indexes.sql (rodar no Supabase, em ordem)
+├── nginx/nginx.conf        # Escalabilidade — load balancer na frente das réplicas (local, HTTP)
+├── nginx/nginx.prod.conf   # Produção — Nginx como borda da VM: HTTPS + balanceamento
+├── certs/                  # Certificado TLS do Nginx de produção (fullchain.pem, privkey.pem — ignorados pelo git)
+├── docs/arquitetura-producao.svg  # Diagrama da arquitetura de produção (embutido abaixo)
 ├── docker-compose.yml      # Escalabilidade — Redis + N réplicas do backend + Nginx (porta 8080)
 ├── docker-compose.test.yml # Override só p/ testes: expõe o Redis em localhost:6379
-├── docker-compose.prod.yml # Modelo de produção: só o backend, contra Redis gerenciado (rediss://)
+├── docker-compose.prod.yml # Produção (o que roda na VM): Nginx com HTTPS + N réplicas do backend; Redis gerenciado fora
 └── frontend/               # Next.js 16 (App Router)
     └── src/
         ├── app/
@@ -131,8 +135,9 @@ projeto-analise-ia/
 6. Repita os passos 2-4 com `backend/sql/002_analysis_pipeline.sql` (colunas da
    Fase 5: `analyses.checklist`, `analyses.status_compliance_geral`,
    `documents.processing_started_at`, `documents.erro`, etc.), e depois com
-   `backend/sql/003_retention.sql` (índice usado pela varredura da Fase 7).
-   Rodar **na ordem** (001 → 002 → 003). Todas são idempotentes
+   `backend/sql/003_retention.sql` (índice usado pela varredura da Fase 7) e
+   `backend/sql/004_scale_indexes.sql` (índices da limpeza de refresh tokens e dos alertas).
+   Rodar **na ordem** (001 → 002 → 003 → 004). Todas são idempotentes
    (`if not exists`), então rodar de novo não quebra nada.
 
 ### 1.3. Criar o bucket de Storage
@@ -947,6 +952,7 @@ docker compose down -v              # derruba tudo
 | `REDIS_URL` | Conexão com o Redis (rate limit, cache, BullMQ). Em produção, `rediss://` (TLS) com senha |
 | `TRUST_PROXY` | `true` só atrás de um proxy conhecido: faz `req.ip` vir do `X-Forwarded-For` |
 | `ENABLE_DEBUG_ENDPOINT` | `true` liga o `/api/debug/instance` (público, fora do rate limit). **Desligado por padrão** (responde 404); só o `docker-compose.yml` local o liga, para os testes. Nunca em produção |
+| `ALERT_WEBHOOK_URL`, `ALERT_WEBHOOK_FORMAT`, `ALERT_CHECK_INTERVAL_MS`, `ALERT_COOLDOWN_MS` | Alertas de monitoramento (ver "Monitoramento e alertas") |
 | `ANALYSIS_CONCURRENCY` | **Sem efeito hoje**: a concorrência do worker é fixa em 2 por réplica (o decorator é avaliado antes do `.env` carregar) |
 | `ANALYSIS_STUCK_TIMEOUT_MS` | Idade a partir da qual um documento em `processing` é reenfileirado (no boot e na varredura periódica) |
 | `ANALYSIS_RECOVERY_INTERVAL_MS` | Intervalo da varredura periódica de documentos parados (padrão 300000 = 5 min) |
@@ -1013,6 +1019,12 @@ qualquer worker processa, uma réplica por job.
   Todas as réplicas registram o mesmo scheduler (idempotente). Por isso a fila
   mostra sempre 1 job `delayed` (o próximo disparo da varredura).
 
+- **Reivindicação condicional do documento:** o worker só passa o documento para `processing`
+  com um `UPDATE` condicional (`status` em `uploaded`/`processing`/`error` e **não excluído**) que
+  devolve as linhas alteradas; se não alterou nenhuma (outro worker concluiu o documento, ou o
+  usuário o excluiu, entre a leitura e a gravação), o job para ali, sem chamar a IA e sem
+  sobrescrever um `done` com `processing`.
+
 **Duplicatas — o que a fila garante e o que não garante.** O Redis só aceita um
 job novo se não existir outro com o mesmo `jobId`. Como o job é apagado ao
 terminar (`removeOnComplete`), o id fica livre; uma cópia que chega *depois* do
@@ -1022,8 +1034,121 @@ rodou exatamente 2×). Com a fila pausada durante a rajada, deu 3.000 execuçõe
 exatas. No app real a análise leva de 30 a 100 s e as cópias de um enqueue chegam
 em milissegundos, então a janela não existe na prática; uma cópia tardia (ex.:
 `recoverPending()`) é barrada pela checagem do banco — o worker ignora documento
-já `done`. Essa checagem só cobre `done`: um documento em `error` reenfileirado
-tarde seria reanalisado (hoje nada reenfileira documentos em `error`).
+já `done`. Essa checagem cobre `done` **e** `error` (estados finais): um job tardio para um
+documento em `error` é ignorado e não o reanalisa.
+
+### Concorrência nas escritas do banco
+
+A fila do BullMQ controla **quem processa** cada análise; ela não protege escritas no banco, e
+garante "ao menos uma vez", não "exatamente uma". Quem impede a corrida de escrita é o próprio
+banco, com atualização condicional (só altera se o estado ainda for o esperado), restrição única e
+`upsert`. Onde isso vale hoje:
+
+| Escrita | Proteção |
+|---|---|
+| Rotação do refresh token (`/api/auth/refresh`) | `UPDATE ... WHERE revoked = false` atômico: de N chamadas simultâneas com o mesmo token, só **1** consegue; as outras caem no caminho de reuso (revogam a família e dão `401`). Antes eram dois passos (ler, depois revogar) e várias passavam: em 8 chamadas simultâneas, 5 deram certo e deixaram 5 tokens válidos |
+| Cadastro (`/api/auth/register`) | O e-mail é único no banco. A leitura "já existe?" não protege sozinha (várias requisições passam por ela); a inserção que o banco recusa agora vira **409** limpo. Antes: 5 cadastros simultâneos com o mesmo e-mail deram 1× `201` e 4× `500`; agora 1× `201` e 4× `409` |
+| Gravação da análise (`analyses`) | `unique(document_id)` + `upsert`: reprocessar não duplica |
+| Status do documento ao iniciar a análise | Reivindicação condicional (acima): nunca sobrescreve `done` nem pega documento excluído |
+| Status `error` (do handler de job falho **e** do `catch` do worker) | `UPDATE` restrito a `uploaded`/`processing`: um worker "zumbi" (que travou e perdeu o job para outro) que falha depois não sobrescreve o `done` do outro |
+| Documento em `error` | É estado final: nada o reenfileira, e um job tardio para ele é ignorado (não é reanalisado) |
+| Exclusão pelo usuário (duas ao mesmo tempo) | `UPDATE ... WHERE deletado_em IS NULL`: só a primeira altera e audita; a segunda é um sucesso silencioso, sem sobrescrever `deletado_em` nem duplicar a auditoria |
+| Exclusão pelo usuário durante a análise | Sem trava: o arquivo some e o worker pode terminar com `error` (não achou o arquivo) ou, se já o tinha baixado, gravar o resultado. Pelo desenho (Fase 7) o resultado em `analyses` sobrevive à exclusão do arquivo |
+
+**Consequência para o frontend:** como o refresh token é de uso único, duas renovações simultâneas
+com o mesmo cookie derrubariam a sessão (a segunda é tratada como reuso). Por isso o cliente HTTP
+(`frontend/src/lib/api.ts`) mantém **uma única renovação em andamento por vez**: chamadas que
+recebem `401` ao mesmo tempo, e o efeito duplicado do `StrictMode`, compartilham a mesma
+requisição. Ao abrir a página sem login isso cai de 4 chamadas ao `refresh` para 1.
+**Várias abas do mesmo navegador** dividem o cookie, então também precisam se revezar: a renovação
+passa por um lock entre abas (Web Locks API, `navigator.locks`). A aba que espera só envia a sua
+requisição quando a outra terminou, já com o cookie novo, sem afrouxar nada no servidor (não há "janela
+de tolerância" para reuso). Em navegador sem Web Locks fica só a proteção dentro da própria aba.
+
+**Redis:** não há corrida de escrita nele. O rate limit usa contadores atômicos (biblioteca), o contador
+de diagnóstico usa `INCR`, o cache de termos só guarda "já aceitou", e os agendadores e a repetição
+dos alertas usam operações idempotentes (`upsertJobScheduler`, `SET ... NX`). A auditoria cobriu as 12
+escritas no banco e as 3 do Redis.
+
+### Carga no banco
+
+Escalar réplicas não escala o banco: o que pesa nele é o quanto o sistema lê e escreve. Uma fila
+na frente das escritas **não** reduz essa carga (só adia e arrisca perder escritas); o que reduz é
+ler menos e não deixar tabelas crescerem sem limite. Auditoria do código, e o que foi feito:
+
+| Fonte de carga | Antes | Agora |
+|---|---|---|
+| Checagem do aceite dos termos (guard de `/api/documents`) | 1 consulta ao banco em **toda** requisição de documentos, inclusive cada polling, sempre com o mesmo resultado para o mesmo usuário | Só o "já aceitou" fica em cache no Redis (`terms:ok:<usuário>:<versão>`, 5 min); quem não aceitou nunca é guardado; versão nova do termo invalida sozinha. Medido ao vivo: a chave aparece no Redis com TTL de 299 s |
+| Polling de status (a tela consulta enquanto o documento está pendente) | A cada 4 s, 2 a 3 leituras por consulta | Intervalo crescente (`frontend/src/lib/polling.ts`): 4 s nas 5 primeiras, 8 s nas 5 seguintes, 15 s depois, 30 s com a aba oculta. Numa análise de 100 s: 25 → 12 consultas (52% a menos). Medido no navegador: 4,6 s, 8,3 s (5 vezes), 15,4 s, e 30,4 s com a aba oculta |
+| Tabela `refresh_tokens` | **Só crescia**: cada renovação de sessão grava uma linha e nada apagava (até ~670 linhas por usuário ativo, 7 dias de rotações) | O job de retenção (a cada hora) apaga em lotes de 100 (até 50 lotes por passada) os **expirados** e os **revogados há mais de 1 dia**; um revogado só precisa existir para o reuso dele ser detectado como roubo, e essa janela passa a ser de ~1 dia. Cai para até ~100 linhas por usuário ativo. Índices na migração 004. Medido ao vivo (versão anterior): 250 expirados apagados pelo PostgREST real, válidos preservados |
+| Varredura de documentos parados e retenção de 72h | Já usam índices (`idx_documents_pendentes`, `idx_documents_retencao`) | Sem mudança |
+
+**O que continua pesando** (não resolvido):
+- Cada consulta de polling ainda faz 1 a 2 leituras (o documento e, na tela de detalhe, a análise). Com
+  muitos usuários esperando ao mesmo tempo isso continua sendo a maior fonte de leitura. A saída seria um
+  cache curto do status ou notificação por servidor (SSE/WebSocket), que não foi feita.
+- `refresh_tokens` ainda guarda uma linha por renovação por cerca de 1 dia (até ~100 por usuário ativo com a
+  sessão renovada a cada 15 min). Guardar uma linha por renovação **não é necessário**: o desenho mínimo é
+  uma linha por sessão, atualizada no lugar (hash atual e hash anterior; o `UPDATE ... WHERE hash = ...`
+  já é a reivindicação atômica). Isso exige mudar a tabela e o código de autenticação (migração nova) e não
+  foi feito. Aumentar `JWT_ACCESS_EXPIRES_IN` também reduz as linhas, à custa de uma janela maior para um
+  access token roubado.
+- `audit_logs` só cresce (login, upload, exclusão); não há retenção.
+- Nada disso foi testado com carga real: os números acima são contas sobre o código e medidas pontuais.
+
+### O que acontece se o Redis cair
+
+Testado ao vivo (derrubando o Redis com 3 réplicas no ar). **Antes da correção a API inteira travava**,
+inclusive o login e o `/api/health`: o guard de rate limit esperava o Redis responder antes de deixar
+qualquer requisição passar (só o `/api/health/ready`, isento do rate limit, respondia). Em produção, uma
+queda do Redis gerenciado derrubaria o site. Agora:
+
+- **Rate limit:** tenta o Redis por até 500 ms e, se falhar, usa um contador em memória **daquela réplica**
+  (`resilient-throttler-storage.ts`). O limite continua valendo, mas deixa de ser somado entre réplicas
+  (com N réplicas fica até N vezes mais folgado) até o Redis voltar. O cliente Redis compartilhado passou a
+  falhar na hora (`enableOfflineQueue: false`), em vez de enfileirar comandos esperando a volta.
+- **Cache de termos:** a leitura falha e cai para o banco.
+- **Fila de análises e agendamentos (BullMQ):** param até o Redis voltar. Uploads continuam sendo aceitos
+  (o enfileiramento não bloqueia a resposta) e os documentos pendentes são resgatados pela varredura depois.
+- **`/api/health/ready`:** responde `503` apontando o Redis; `/api/health` segue `200`.
+- Os alertas de monitoramento também dependem do Redis, então **não** avisam sobre a própria queda dele:
+  para isso serve o monitor externo (abaixo).
+
+**Redis e escala horizontal:** o Redis escala para cima (instância maior) e, com Redis Cluster, também para
+os lados (dados divididos entre nós). O que usamos é uma instância única; usar Cluster exigiria mudar o
+código (cliente de cluster, prefixo das filas do BullMQ entre chaves para manter as chaves de uma fila no
+mesmo nó, e o armazenamento do rate limit), o que não foi feito e não é necessário para a carga atual (o
+Redis só guarda fila, contadores e cache).
+
+### Monitoramento e alertas
+
+Um job repetível (BullMQ, uma execução por minuto em **uma** réplica, `src/monitoring`) avalia o estado do
+sistema e avisa por **webhook** quando uma condição aparece e quando ela some ("resolvido"). O mesmo alerta
+não se repete dentro de `ALERT_COOLDOWN_MS` (depois disso vira um lembrete). Sem `ALERT_WEBHOOK_URL`, os
+alertas só aparecem no log (`ALERTA [CRÍTICO] ...`), e a validação de produção avisa disso.
+
+| Regra | Dispara quando | Gravidade |
+|---|---|---|
+| Documentos parados | há documento pendente (`uploaded`/`processing`) há mais de 15 min (a varredura deveria ter resgatado) | crítica |
+| Taxa de erro alta | com pelo menos 5 análises finalizadas nos últimos 15 min, 50% ou mais terminaram em erro (falha ou limite do modelo de IA) | crítica |
+| Banco inacessível | as consultas ao banco falham | crítica |
+| Rotina parada | a retenção não roda há mais de 2,5 h, ou a varredura há mais de 4× o intervalo (mín. 15 min); cada rotina grava um batimento no Redis | crítica |
+| Fila acumulada | mais de 50 análises esperando | aviso |
+| Jobs falhos | algum job de análise falhou de vez nas últimas 2 h (ex.: workers que caíram) | aviso |
+
+| Variável | Para quê |
+|---|---|
+| `ALERT_WEBHOOK_URL` | Endereço do webhook (Slack, Teams, Mattermost, Discord, Telegram via bot, ou o seu serviço) |
+| `ALERT_WEBHOOK_FORMAT` | `slack` (campo `text`, o padrão), `discord` (campo `content`) ou `generic` (JSON completo: estado, regra, severidade, detalhe) |
+| `ALERT_CHECK_INTERVAL_MS` | Intervalo da avaliação (padrão 60000) |
+| `ALERT_COOLDOWN_MS` | Quanto tempo um alerta que continua disparado fica sem ser repetido (padrão 1800000 = 30 min) |
+
+**Monitor externo de disponibilidade (necessário):** se o app inteiro cair, o job de alertas cai junto e não
+avisa ninguém. Configure no seu provedor (ou em qualquer serviço de uptime) uma checagem periódica em
+`GET /api/health/ready`, que responde `200` (Redis e banco ok) ou `503` (algum deles fora) em até ~2 s, mais
+um alerta quando ela falhar. O `/api/health` continua sendo só a vida do processo (healthcheck do container).
+O endpoint tem cache de 5 s por réplica e está sujeito a abuso como qualquer rota pública: use um intervalo de
+30 s a 1 min.
 
 ### Etapa 5 — Retenção de 72h como job repetível
 
@@ -1077,10 +1202,20 @@ entre elas e o limite de login vale somado.
 | `backend/scripts/test-queue-race.ts` | 6 a 20 documentos reais, cada um enfileirado 15× ao mesmo tempo por 3 produtores independentes, 3 réplicas consumindo; replay de documentos `done`; com `--kill`, mata uma réplica no meio da análise | Cada documento processado exatamente 1×, 0 linhas duplicadas em `analyses`, 0 reanálises no replay; com a réplica morta, todos terminaram (20 docs / 300 enqueues: 18 `done`, 2 `error` por resposta da IA fora do schema) |
 | `backend/scripts/test-double-stall.ts` | Mata duas réplicas em sequência durante a análise do mesmo documento | Antes da correção: documento preso em `processing`. Depois: `error` com a mensagem ao usuário |
 | **Frontend no navegador atrás do Nginx** (manual: `NEXT_PUBLIC_API_URL=http://localhost:8080 npm run dev` em `frontend/`, com o Compose local no ar) | Fluxo real de usuário: cadastro, aceite de termos, recarregar a página (a sessão volta pelo cookie `httpOnly` via `/api/auth/refresh`), upload de um PDF, polling do status na lista, tela de erro, tela de resultado, sair e entrar de novo | Tudo funcionou: todas as chamadas passaram por `localhost:8080` com CORS (preflight `204`), sem erro de CORS no console; o upload foi processado por uma réplica, a lista atualizou sozinha de "Processando" para "Concluído" e o resultado mostrou resumo, selo de conformidade e checklist de 23 itens. Um documento terminou em "Erro" por resposta da IA fora do schema (a falha conhecida do modelo gratuito), e a tela mostrou a mensagem com o convite a reenviar |
-| `backend/scripts/test-status-retry.ts` (`npm run status-retry:test`) | **Offline** (sem Redis/Supabase/IA): simula o banco falhando ao gravar o status e confere as tentativas, a seleção da varredura e o handler de `failed` | 9 de 9 verificações passaram |
+| `backend/scripts/test-status-retry.ts` (`npm run status-retry:test`) | **Offline** (sem Redis/Supabase/IA): simula o banco falhando ao gravar o status e confere as tentativas, a seleção da varredura, o handler de `failed` a reivindicação condicional (não sobrescreve `done`, não pega excluído, a janela entre a leitura e a gravação), `error` como estado final e o worker zumbi | 20 de 20 verificações passaram |
 | `backend/scripts/test-recovery-sweep.ts` | **Ao vivo**: cria um documento `processing` há 15 min e outro `uploaded` há 10 min, sem nenhum job na fila, e deixa o scheduler resgatá-los | 5 de 5: um único scheduler apesar de 3 réplicas; os dois documentos concluídos; cada um processado 1× |
-| `backend/scripts/test-production-checks.ts` (`npm run prod-checks:test`) | **Offline**: a validação de configuração de produção — cada regra, o que é erro (aborta o boot) e o que é só aviso, e que fora de produção ela não interfere | 17 de 17 verificações passaram |
+| `backend/scripts/test-production-checks.ts` (`npm run prod-checks:test`) | **Offline**: a validação de configuração de produção — cada regra, o que é erro (aborta o boot) e o que é só aviso, e que fora de produção ela não interfere | 18 de 18 verificações passaram |
 | `backend/scripts/test-redis-tls.sh` | O backend contra um **Redis com TLS e senha** (certificados descartáveis, containers temporários): conexão `rediss://`, contador, rate limit, schedulers e um job consumido pelo worker do BullMQ, `/api/debug` desligado = 404, e três casos negativos (sem a CA, senha errada, política `allkeys-lru`) | 14 de 14 verificações passaram |
+| `backend/scripts/test-refresh-race.js` | **Ao vivo**, pela API (3 réplicas atrás do Nginx): N chamadas simultâneas a `/api/auth/refresh` com o MESMO cookie | Antes da correção: 8 chamadas, **5** deram certo e 5 tokens válidos sobraram. Depois: 1 dá certo e no máximo 1 token válido sobra, em 6, 12 e 18 chamadas paralelas |
+| `backend/scripts/test-frontend-single-flight.ts` (`npm run frontend-refresh:test`) | **Offline**: a renovação única do frontend (`fetch` falso que conta as chamadas) | 8 de 8: 6 renovações simultâneas = 1 requisição; 5 chamadas com token expirado = 1 renovação; sequenciais = 1 cada; a trava é liberada depois de uma falha |
+| `backend/scripts/test-db-load.ts` (`npm run db-load:test`) | **Offline**: cache dos termos (1 consulta em 5 requisições, quem não aceitou não é guardado, versão nova invalida, erro do Redis cai para o banco), limpeza de tokens em lotes a limpeza de tokens revogados antigos e o intervalo crescente do polling | 13 de 13 verificações passaram |
+| `backend/scripts/test-db-load-live.js` | **Ao vivo** (Supabase e Redis reais, 3 réplicas): a chave de cache dos termos no Redis, o 403 de quem não aceitou, e o job de retenção apagando 250 tokens expirados | 6 de 6 verificações passaram |
+| `backend/scripts/test-register-race.js` | **Ao vivo**: 5 cadastros simultâneos com o MESMO e-mail | Antes: 1× `201` e 4× `500`. Depois: 1× `201` e 4× `409` |
+| `backend/scripts/test-multi-tab-refresh.ts` (`npm run multi-tab:test`) | **Offline**: servidor simulado (uso único, reuso derruba a família) + cookie compartilhado + várias "abas" | 4 de 4: sem o lock, 2 abas derrubam a sessão (controle); com Web Locks, 2 e 5 abas renovam todas, com 1 requisição por aba |
+| `backend/scripts/test-alerts.ts` (`npm run alerts:test`) | **Offline**: cada regra, repetição (cooldown e lembrete), "resolvido", formatos do webhook, falhas | 28 de 28 verificações passaram |
+| `backend/scripts/test-alerts-live.js` | **Ao vivo**: receptor de webhook local, documentos reais parados e com erro no Supabase, queda e volta do Redis | 10 de 10: o alerta chega, não se repete no cooldown, o "resolvido" chega, o batimento da retenção é gravado e `/api/health/ready` responde 503 com o Redis fora e volta a 200 |
+| `backend/scripts/test-resilient-throttler.ts` (`npm run throttler-resilient:test`) | **Offline**: rate limit com o Redis saudável, com erro, travado e voltando | 6 de 6 verificações passaram |
+| `backend/scripts/test-redis-down-live.js` | **Ao vivo**: derruba o Redis com 3 réplicas no ar e testa login, `/api/health`, `/api/health/ready`, rotas autenticadas e o rate limit | 8 de 8: com o Redis parado, o login responde `401` em ~1 s (antes travava), `/api/health` responde `200` em ~10 ms, `/api/health/ready` responde `503`, uma rota autenticada responde `200` (o cache de termos cai para o banco) e o rate limit continua valendo por réplica (429 na 10ª tentativa com 3 réplicas); com o Redis de volta, tudo normaliza e o contador volta a ser gravado nele |
 | `backend/scripts/test-e2e-http.js` | Pela API HTTP: cadastro, termos, login, 8 uploads simultâneos, leitura do resultado — sempre alternando réplicas | Tudo passou; 8 documentos, cada um processado 1× |
 | `backend/scripts/test-load-balancer.js` | Nginx: distribuição, contador, IP real e header forjado, upload grande, **dois dispositivos na mesma conta**, rate limit global, réplica morta, escala para 5 réplicas | 15 de 15 verificações passaram (distribuição 56/49/45; 0 falhas em 60 requisições com uma réplica morta; 5 réplicas usadas sem reiniciar o Nginx) |
 | Carga na camada da fila (3.000 jobs, 30.000 enqueues, 3 workers em containers separados) | O comportamento do BullMQ sob volume | 3.000 execuções exatas com a fila pausada na rajada; 286 duplicados sem pausar (ver Etapa 4). **O script não ficou no repositório** |
@@ -1096,6 +1231,16 @@ TS_NODE_FILES=true npx ts-node scripts/test-double-stall.ts          # mata 2 r�
 TS_NODE_FILES=true npx ts-node scripts/test-recovery-sweep.ts        # varredura de documentos parados (intervalo de 30 s do override)
 npm run status-retry:test                                             # offline, não precisa de Docker
 npm run prod-checks:test                                              # offline, não precisa de Docker
+npm run frontend-refresh:test                                         # offline, não precisa de Docker
+npm run db-load:test                                                  # offline, não precisa de Docker
+npm run multi-tab:test                                                # offline, não precisa de Docker
+npm run alerts:test                                                   # offline, não precisa de Docker
+npm run throttler-resilient:test                                      # offline, não precisa de Docker
+node backend/scripts/test-register-race.js                            # ao vivo; precisa do Nginx em :8080
+node backend/scripts/test-alerts-live.js                              # ao vivo; precisa do Compose de teste (webhook em :9099)
+node backend/scripts/test-redis-down-live.js                          # ao vivo; derruba e religa o Redis do Compose
+node backend/scripts/test-db-load-live.js                             # ao vivo; precisa do Compose de teste (Redis em :6379)
+node backend/scripts/test-refresh-race.js                             # ao vivo; precisa do Nginx em :8080 (LB_URL para mudar)
 bash backend/scripts/test-redis-tls.sh                                # Docker + openssl; precisa de `npm run build` antes
 cd ..
 node backend/scripts/test-load-balancer.js                           # precisa do Nginx em :8080; leva alguns minutos
@@ -1142,10 +1287,18 @@ rodar: confira o Supabase por usuários `race-test+`, `stall-test+`, `sweep-test
   chamada conta no limite geral de 30 por minuto por IP dessa rota. Não foi alterado.
 - O `next dev` (Next 16) gera `frontend/AGENTS.md` e `frontend/CLAUDE.md` ao iniciar;
   não fazem parte do projeto e não devem ser commitados.
+- **Limite diário do plano gratuito do OpenRouter** (`free-models-per-day`): depois de algumas
+  dezenas de análises no dia, as chamadas recebem `429` e todas as análises terminam em `error`
+  ("Add 10 credits to unlock 1000 free model requests per day"). Aconteceu durante os testes. Em
+  produção real é preciso um modelo pago ou créditos.
 - Cerca de 1 em cada 10 análises do modelo gratuito termina em `error` por
   resposta fora do schema (falha da IA, não da fila).
 
 ### Preparação para produção (feita no repositório, sem criar nada na nuvem)
+
+Arquitetura alvo de produção (o Redis é um serviço gerenciado, **fora** da VM, na mesma rede privada):
+
+![Arquitetura de produção](docs/arquitetura-producao.svg)
 
 O que o repositório já traz para ir a produção:
 
@@ -1157,15 +1310,28 @@ O que o repositório já traz para ir a produção:
   `localhost` (em produção não há Redis na própria máquina). *Avisos que não
   abortam:* Redis sem TLS (`redis://`) ou sem senha; `FRONTEND_URL` sem `https://`
   (o cookie `secure` do refresh token não é enviado por HTTP); `TRUST_PROXY` desligado;
-  `ENABLE_DEBUG_ENDPOINT=true`.
+  `ENABLE_DEBUG_ENDPOINT=true`; `ALERT_WEBHOOK_URL` ausente (os alertas ficariam só no log).
 - **`backend/.env.production.example`**: modelo com todas as variáveis de produção
   (segredos como placeholders). Copie para `backend/.env.production` (ignorado pelo
   git) ou cadastre cada variável no painel do provedor.
-- **`docker-compose.prod.yml`**: só o backend (sem Redis e sem Nginx no Compose, porque
-  em produção são serviços do provedor), `restart: unless-stopped`, porta só em
-  `127.0.0.1`, limites de memória/CPU e healthcheck. Serve para testar a imagem de
-  produção antes do deploy e como referência; a maioria dos provedores roda a imagem
-  direto, com as variáveis no painel.
+- **`docker-compose.prod.yml`** — o que roda na VM, conforme o diagrama acima:
+  - `nginx`: borda da VM, escuta 80 e 443, redireciona HTTP para HTTPS e reparte as
+    requisições entre as réplicas (`nginx/nginx.prod.conf`, com o certificado em `./certs`).
+    Por ser a borda, **sobrescreve** o `X-Forwarded-For` com o IP de quem conectou.
+  - `backend`: N réplicas (`BACKEND_REPLICAS`, padrão 2), `TRUST_PROXY=true` e
+    `ENABLE_DEBUG_ENDPOINT=false` fixos, healthcheck, limite de memória e CPU por réplica.
+  - Os dois com `restart: unless-stopped`.
+  - **Sem Redis no Compose**: o `REDIS_URL` do `.env.production` aponta para o serviço
+    gerenciado. Se ele usar uma CA própria (não pública), descomente as 3 linhas indicadas
+    no arquivo e coloque a CA em `./certs/redis-ca.pem`.
+  - Suba com `docker compose -f docker-compose.prod.yml up -d --build`; faça o build **na VM**
+    (uma imagem construída em um Mac com chip Apple é arm64 e não roda em uma VM x86).
+- **Certificado do Nginx:** o compose espera `./certs/fullchain.pem` e `./certs/privkey.pem`
+  (sem eles o Nginx não sobe). Quem emite é um passo à parte. Exemplo com Let's Encrypt,
+  **não executado aqui** (precisa de um domínio público apontando para a VM), antes de subir o compose:
+  `docker run --rm -p 80:80 -v "$PWD/le:/etc/letsencrypt" certbot/certbot certonly --standalone -d api.seudominio.com`,
+  e copiar `le/live/api.seudominio.com/{fullchain,privkey}.pem` para `./certs/`. A renovação
+  (a cada ~60 dias) precisa parar o Nginx por alguns segundos ou usar o modo `--webroot`.
 - **`/api/debug` desligado por padrão** (404).
 - **Redis com TLS e senha**: não foi preciso mudar código. O `ioredis` (e o BullMQ, que o
   usa) entende `rediss://usuario:senha@host:porta`. Com a CA do provedor pública não há
@@ -1182,7 +1348,21 @@ configuração**, conectado ao Redis por TLS, `/api/health` = 200, `/api/debug/i
 aborta com código 1 (sem as variáveis obrigatórias, e com `REDIS_URL` em `localhost`); configuração
 só arriscada (Redis sem TLS/senha, `FRONTEND_URL` http, `TRUST_PROXY` off, debug ligado) apenas avisa.
 
+**O compose de produção em si** (`docker-compose.prod.yml`, testado localmente com certificado
+autoassinado e o Redis com TLS e senha, usando as instruções de CA privada do próprio arquivo):
+HTTP responde `301` para HTTPS; HTTPS responde `200` com HTTP/2 e TLS 1.3; `/api/debug/instance` = `404`;
+as 2 réplicas conectaram no Redis por TLS e subiram sem nenhum aviso de configuração; o rate limit
+vale pelo HTTPS (5 respostas `401` e depois `429`); o IP gravado na auditoria é o de quem conectou e
+**não** o do `X-Forwarded-For` forjado; um `SIGKILL` no processo `node` de uma réplica foi seguido de reinício
+automático (`restart: unless-stopped`) e a réplica voltou saudável; `BACKEND_REPLICAS=3` escalou para 3
+réplicas sem reiniciar o Nginx. Um detalhe do teste: `docker kill` conta como parada manual e **não**
+dispara o reinício automático, então não serve para simular uma queda (o `SIGKILL` no processo, sim).
+
 **O que NÃO foi verificado** (precisa de conta e infraestrutura reais):
+
+- **A emissão real do certificado** (Let's Encrypt ou do provedor) e a renovação.
+- O que acontece com o Nginx **sem** os certificados em `./certs` (pela documentação do Nginx, ele
+  não sobe; não testei).
 
 - Um **Redis gerenciado de verdade**. Só foi testado um Redis com TLS e senha local.
   Provedores variam: alguns restringem comandos administrativos (o aviso de eviction
@@ -1204,12 +1384,16 @@ gerenciado, não um container.
    senão pode perder jobs por eviction); mesma região do backend; e o limite de
    conexões do plano — cada réplica abre várias (cliente compartilhado mais as conexões
    do BullMQ por fila e worker).
-2. **Réplicas reais:** publicar a imagem em um registry, cadastrar as variáveis no
-   provedor (a partir do `.env.production.example`; **gere um par de chaves JWT novo**),
-   mínimo de 2 instâncias, healthcheck em `/api/health`.
-3. **Load balancer do provedor** no lugar do Nginx local (que é só simulação).
-   `TRUST_PROXY=true` apenas com proxy de fato na frente, e o número de saltos
-   (`trust proxy 1`) tem de bater com a topologia (CDN + LB contam como mais de um).
+2. **Réplicas na VM:** use o `docker-compose.prod.yml` (acima): `.env.production` a partir do
+   `.env.production.example` (**gere um par de chaves JWT novo**), certificado em `./certs`, e
+   `docker compose -f docker-compose.prod.yml up -d --build` na própria VM. Alternativa: publicar
+   a imagem em um registry e rodá-la direto no provedor, com as variáveis no painel.
+3. **Mais de uma VM, ou um load balancer/CDN na frente do Nginx:** o `nginx.prod.conf` assume que
+   ele é a borda e sobrescreve o `X-Forwarded-For`; com outro proxy na frente, ele passaria a
+   registrar o IP desse proxy em vez do cliente. Nesse caso é preciso mudar o Nginx (confiar no
+   cabeçalho do proxy conhecido, via `real_ip`) e conferir o número de saltos do `trust proxy`
+   (hoje 1). O frontend e a API devem ficar sob o mesmo domínio raiz (o cookie do refresh token
+   é `SameSite=strict`).
 4. **`NODE_ENV=production` exige HTTPS:** o cookie do refresh token passa a ser
    `secure`. Localmente o container usa `NODE_ENV=development` (vem do `.env`).
 5. **Antes de ir:** subir uma vez com a validação de produção (ela lista o que está
@@ -1240,7 +1424,7 @@ hoje.
 | Serviço | Pra que serve aqui | Onde está referenciado | Como ligar | Sem ele |
 |---|---|---|---|---|
 | **ClamAV** (`clamd`) | Scanner de vírus/malware por assinatura no upload de documentos (Fase 8) | `MalwareScanService` + `clamav.client.ts` (`src/documents/security/`), atrás de `ANTIVIRUS_ENABLED` | `docker run -p 3310:3310 clamav/clamav`, depois `ANTIVIRUS_ENABLED=true` + `CLAMAV_HOST`/`CLAMAV_PORT` no `.env` — é um switch, o código já fala o protocolo `INSTREAM` de verdade | Só a heurística estática de PDF roda (cobre os vetores mais comuns de PDF malicioso, mas não é um scanner de assinaturas) |
-| **Reverse proxy / load balancer** | Distribuir requisições entre as réplicas e terminar HTTPS; pré-requisito pra `TRUST_PROXY=true` fazer sentido | Local: `nginx/nginx.conf` + serviço `nginx` do Compose (simulação, porta 8080). `TRUST_PROXY` em `configuration.ts`/`main.ts` | Local: `docker compose up -d --build`. Produção: o load balancer do provedor de deploy no lugar do Nginx local; só ligue `TRUST_PROXY=true` depois de confirmar que existe um proxy de fato na frente | Sem proxy, `req.ip` usa o IP direto da conexão TCP — correto em dev local e em deploy sem proxy na frente |
+| **Reverse proxy / load balancer** | Distribuir requisições entre as réplicas e terminar HTTPS; pré-requisito pra `TRUST_PROXY=true` fazer sentido | Local: `nginx/nginx.conf` + serviço `nginx` do Compose (simulação, porta 8080). `TRUST_PROXY` em `configuration.ts`/`main.ts` | Local: `docker compose up -d --build`. Produção (VM): `nginx/nginx.prod.conf` com HTTPS, pelo `docker-compose.prod.yml`; um load balancer do provedor na frente exige mudar o Nginx (ver "Migrar para produção"); só ligue `TRUST_PROXY=true` depois de confirmar que existe um proxy de fato na frente | Sem proxy, `req.ip` usa o IP direto da conexão TCP — correto em dev local e em deploy sem proxy na frente |
 | **Docker / Docker Compose** | Rodar Redis, as réplicas do backend e o Nginx juntos na máquina | `backend/Dockerfile`, `docker-compose.yml`, `docker-compose.test.yml` | Instalar o Docker Desktop; `docker compose up -d --build` | O backend roda com `npm run start:dev`, mas precisa de um Redis em `REDIS_URL` e só tem 1 instância |
 | **`pg_cron`** (extensão nativa do Supabase) | Alternativa ao Redis pra agendar a retenção da Fase 7 **sem infraestrutura nova** — roda dentro do próprio Postgres do Supabase | Mencionado como opção na seção "Para escalar" da Fase 7 (a opção adotada foi o job repetível do BullMQ) | Habilitar a extensão no painel do Supabase e mover a lógica de `RetentionService.purgeExpired()` pra uma function SQL agendada | Não é necessária: a retenção já roda como job repetível do BullMQ |
 

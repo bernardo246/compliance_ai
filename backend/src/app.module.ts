@@ -4,6 +4,7 @@ import { ConfigModule, ConfigService } from '@nestjs/config';
 import Redis from 'ioredis';
 import { BullModule } from '@nestjs/bullmq';
 import { ThrottlerStorageRedisService } from '@nest-lab/throttler-storage-redis';
+import { ResilientThrottlerStorage } from './common/redis/resilient-throttler-storage';
 import { ThrottlerModule, ThrottlerGuard } from '@nestjs/throttler';
 import configuration from './config/configuration';
 import { RedisModule, REDIS_CLIENT } from './common/redis/redis.module';
@@ -13,6 +14,7 @@ import { AuthModule } from './auth/auth.module';
 import { UsersModule } from './users/users.module';
 import { DocumentsModule } from './documents/documents.module';
 import { AnalysisModule } from './analysis/analysis.module';
+import { MonitoringModule } from './monitoring/monitoring.module';
 import { HealthController } from './health.controller';
 import { DebugController } from './common/debug/debug.controller';
 
@@ -32,7 +34,9 @@ import { DebugController } from './common/debug/debug.controller';
             limit: 30,
           },
         ],
-        storage: new ThrottlerStorageRedisService(redis),
+        // Se o Redis cair, o rate limit degrada para contadores em memória por réplica
+        // em vez de travar a API inteira (ver resilient-throttler-storage.ts).
+        storage: new ResilientThrottlerStorage(new ThrottlerStorageRedisService(redis)),
       }),
     }),
     BullModule.forRootAsync({
@@ -48,6 +52,7 @@ import { DebugController } from './common/debug/debug.controller';
     UsersModule,
     DocumentsModule,
     AnalysisModule,
+    MonitoringModule,
   ],
   controllers: [HealthController, DebugController],
   providers: [
