@@ -1,0 +1,65 @@
+# Monitor EXTERNO de disponibilidade: de 5 em 5 minutos consulta /api/health/ready
+# a partir da infraestrutura do GitHub (fora da sua VM, do Redis e do banco), então
+# continua avisando mesmo se a aplicação inteira cair, o que os alertas internos
+# (que rodam dentro do app) não conseguem.
+#
+# Para ligar, no repositório: Settings → Secrets and variables → Actions
+#   Variables  → HEALTH_URL           https://SEU-DOMINIO/api/health/ready   (obrigatória)
+#   Secrets    → ALERT_WEBHOOK_URL    o mesmo webhook dos alertas internos   (recomendado)
+#   Variables  → ALERT_WEBHOOK_FORMAT slack | discord | generic              (opcional)
+# Sem HEALTH_URL o workflow não faz nada (não falha à toa em forks / antes do deploy).
+#
+# Limites do GitHub Actions: o intervalo mínimo é 5 min e o agendamento é "melhor esforço"
+# (pode atrasar em horário de pico); em repositório público, o GitHub desativa workflows
+# agendados após 60 dias sem atividade no repositório. Para checagem a cada 1 min, use um
+# monitor dedicado (ver README) apontado para a mesma URL.
+name: uptime
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: uptime
+  cancel-in-progress: false
+
+jobs:
+  checar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: backend/scripts/uptime-check.js
+          sparse-checkout-cone-mode: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # O estado ("estava fora") vive no cache do Actions: um aviso por queda e um "resolvido".
+      # restore + save separados para o estado ser salvo MESMO quando a checagem falha.
+      - name: Restaurar estado
+        uses: actions/cache/restore@v4
+        with:
+          path: .uptime-state
+          key: uptime-state-${{ github.run_id }}
+          restore-keys: uptime-state-
+      - name: Consultar /api/health/ready
+        if: ${{ vars.HEALTH_URL != '' }}
+        env:
+          HEALTH_URL: ${{ vars.HEALTH_URL }}
+          ALERT_WEBHOOK_URL: ${{ secrets.ALERT_WEBHOOK_URL }}
+          ALERT_WEBHOOK_FORMAT: ${{ vars.ALERT_WEBHOOK_FORMAT }}
+          UPTIME_STATE_FILE: .uptime-state/estado
+        run: |
+          mkdir -p .uptime-state
+          node backend/scripts/uptime-check.js
+      - name: Salvar estado
+        if: ${{ always() && vars.HEALTH_URL != '' }}
+        uses: actions/cache/save@v4
+        with:
+          path: .uptime-state
+          key: uptime-state-${{ github.run_id }}

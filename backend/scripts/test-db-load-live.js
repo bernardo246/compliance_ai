@@ -4,6 +4,7 @@
 //      a /api/documents, e quem não aceitou o termo toma 403 e não é guardado
 //   2. limpeza de refresh tokens expirados: 250 expirados + 5 válidos no banco,
 //      o job de retenção é disparado pela fila e só os expirados somem
+//   3. janela dos revogados (1 h por padrão): revogado de 2 h atrás some, o de 10 min fica
 //
 // Pré-requisito: docker compose -f docker-compose.yml -f docker-compose.test.yml up -d --build
 //   node backend/scripts/test-db-load-live.js
@@ -91,6 +92,23 @@ async function main() {
     console.log(`   depois do job: ${exp1} expirados, ${val1} válidos`);
     check('o job de retenção apagou todos os 250 tokens expirados (em lotes, pelo PostgREST real)', exp0 >= 250 && exp1 === 0);
     check('os tokens ainda válidos foram preservados', val1 === val0 && val1 >= 5, `${val1} válidos`);
+
+    // ---- 3. janela dos revogados (1 h): linha com created_at controlado, job real -------
+    const hAtras = (h) => new Date(Date.now() - h * 3600_000).toISOString();
+    const mk = (created_at) => ({ user_id: dono, token_hash: randomBytes(32).toString('hex'), expires_at: futuro, revoked: true, created_at });
+    const rev2h = mk(hAtras(2));
+    const rev10m = mk(new Date(Date.now() - 10 * 60_000).toISOString());
+    const insRev = await supabase.from('refresh_tokens').insert([rev2h, rev10m]);
+    if (insRev.error) throw new Error('insert revogados: ' + insRev.error.message);
+    const existe = async (hash) => {
+      const { count } = await supabase.from('refresh_tokens').select('id', { count: 'exact', head: true }).eq('token_hash', hash);
+      return count === 1;
+    };
+    await queue.add('purgar', {}, { removeOnComplete: true, removeOnFail: true });
+    let apagou2h = false;
+    for (let i = 0; i < 40 && !apagou2h; i++) { await sleep(1500); apagou2h = !(await existe(rev2h.token_hash)); }
+    check('janela de 1 h: o revogado de 2 h atrás foi apagado pelo job real', apagou2h);
+    check('janela de 1 h: o revogado de 10 min atrás foi preservado (ainda detecta reuso)', await existe(rev10m.token_hash));
   } finally {
     for (const id of userIds) {
       await supabase.from('audit_logs').delete().eq('user_id', id);

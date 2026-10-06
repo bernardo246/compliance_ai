@@ -46,6 +46,15 @@ export default () => ({
     publicKey: (process.env.JWT_PUBLIC_KEY ?? '').replace(/\\n/g, '\n'),
     accessExpiresIn: process.env.JWT_ACCESS_EXPIRES_IN ?? '15m',
     refreshExpiresIn: process.env.JWT_REFRESH_EXPIRES_IN ?? '7d',
+    // Por quanto tempo um refresh token JÁ USADO (revogado) continua no banco. Ele só
+    // precisa existir para que o reuso dele seja detectado como roubo; depois disso o
+    // job de retenção o apaga (a cada hora). Menor = menos linhas no banco; a janela de
+    // detecção de roubo por reuso encolhe junto (o token continua sendo recusado).
+    // Padrão 1 hora, mínimo 1 minuto.
+    revokedRefreshRetentionMs: Math.max(
+      60_000,
+      parseInt(process.env.REFRESH_REVOKED_RETENTION_MS ?? '3600000', 10) || 3_600_000,
+    ),
   },
 
   terms: {

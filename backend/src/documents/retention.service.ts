@@ -117,25 +117,25 @@ export class RetentionService implements OnModuleInit {
    * linha em `refresh_tokens` (rotação) e nada as removia: a tabela só crescia.
    * Duas passadas:
    *  - EXPIRADOS: não servem a nada (nem para detectar reuso);
-   *  - REVOGADOS há mais de 1 dia (pela data de emissão): um token revogado só
-   *    precisa existir para o reuso dele ser detectado como roubo; depois de um
-   *    dia a janela de detecção acabou e o token, revogado, já era recusado de
-   *    qualquer forma (aqui passa a ser "inválido" em vez de "reuso").
-   * Isso reduz o que fica no banco de ~7 dias de rotações para ~1 dia.
+   *  - REVOGADOS há mais de `jwt.revokedRefreshRetentionMs` (padrão 1 hora, pela data
+   *    de emissão): um token revogado só precisa existir para o reuso dele ser
+   *    detectado como roubo (e derrubar a sessão inteira); passada a janela, ele já
+   *    era recusado de qualquer forma (aqui passa a ser "inválido" em vez de "reuso").
    * Em lotes pequenos (a URL do DELETE leva os ids): até 50 lotes de 100 por
    * passada; um acúmulo grande é drenado nas próximas execuções horárias.
    */
   async purgeStaleRefreshTokens(): Promise<number> {
     const agora = new Date();
-    const umDiaAtras = new Date(agora.getTime() - 24 * 3600 * 1000).toISOString();
+    const janelaMs = this.config.get<number>('jwt.revokedRefreshRetentionMs') ?? 3_600_000;
+    const limiteRevogados = new Date(agora.getTime() - janelaMs).toISOString();
     const expirados = await this.purgeRefreshTokenBatches((q) => q.lt('expires_at', agora.toISOString()));
     const revogadosAntigos = await this.purgeRefreshTokenBatches((q) =>
-      q.eq('revoked', true).lt('created_at', umDiaAtras),
+      q.eq('revoked', true).lt('created_at', limiteRevogados),
     );
     const total = expirados + revogadosAntigos;
     if (total > 0) {
       this.logger.log(
-        `Refresh tokens apagados: ${total} (${expirados} expirados, ${revogadosAntigos} revogados há mais de 1 dia).`,
+        `Refresh tokens apagados: ${total} (${expirados} expirados, ${revogadosAntigos} revogados há mais de ${Math.round(janelaMs / 60_000)} min).`,
       );
     }
     return total;

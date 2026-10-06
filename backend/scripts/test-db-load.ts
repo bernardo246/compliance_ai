@@ -2,12 +2,13 @@
  * Teste OFFLINE das três mudanças que tiram carga do banco:
  *   1. cache do aceite dos termos (TermsAcceptedGuard) — uma consulta ao banco
  *      a cada requisição de documentos vira uma a cada alguns minutos
- *   2. limpeza em lotes de refresh tokens expirados (RetentionService)
+ *   2. limpeza em lotes de refresh tokens expirados e revogados, com janela configurável (RetentionService)
  *   3. intervalo crescente do polling do frontend (frontend/src/lib/polling.ts)
  */
 import { ForbiddenException, Logger } from '@nestjs/common';
 import { TermsAcceptedGuard } from '../src/common/guards/terms-accepted.guard';
 import { RetentionService } from '../src/documents/retention.service';
+import configuration from '../src/config/configuration';
 import { pollDelayMs } from '../../frontend/src/lib/polling';
 
 const resultados: boolean[] = [];
@@ -15,6 +16,8 @@ const check = (nome: string, ok: boolean, extra = '') => {
   resultados.push(ok);
   console.log(`${ok ? '✅' : '❌'} ${nome}${extra ? ' — ' + extra : ''}`);
 };
+
+const retCfg = (ms?: number) => ({ get: (k: string) => (k === 'jwt.revokedRefreshRetentionMs' ? ms ?? 3_600_000 : undefined) });
 
 // ---------- fakes -----------------------------------------------------------
 class FakeRedis {
@@ -115,37 +118,55 @@ async function main() {
   // ===== 2. limpeza de refresh tokens ============================================
   {
     const db = fakeTokensDb(250, 30);
-    const apagados = await new RetentionService(db as any, {} as any, {} as any).purgeStaleRefreshTokens();
+    const apagados = await new RetentionService(db as any, retCfg() as any, {} as any).purgeStaleRefreshTokens();
     check('apaga os 250 expirados em lotes e preserva os 30 válidos', apagados === 250 && db.rows.length === 30 && db.rows.every((r) => r.id.startsWith('v')), `apagados=${apagados}, restam=${db.rows.length}, DELETEs=${db.deletes}`);
   }
   {
     const velho = new Date(Date.now() - 3 * 86_400_000).toISOString();
-    const recente = new Date(Date.now() - 3_600_000).toISOString();
+    const duasHoras = new Date(Date.now() - 2 * 3_600_000).toISOString();
+    const quarentaMin = new Date(Date.now() - 40 * 60_000).toISOString();
+    const recente = new Date(Date.now() - 10 * 60_000).toISOString();
     const futuro = new Date(Date.now() + 86_400_000).toISOString();
-    const db = fakeTokensDb(0, 0, false, [
+    const linhas = () => [
       { id: 'rev-velho', expires_at: futuro, revoked: true, created_at: velho },
+      { id: 'rev-2h', expires_at: futuro, revoked: true, created_at: duasHoras },
+      { id: 'rev-40min', expires_at: futuro, revoked: true, created_at: quarentaMin },
       { id: 'rev-recente', expires_at: futuro, revoked: true, created_at: recente },
       { id: 'ativo-velho', expires_at: futuro, revoked: false, created_at: velho },
-    ]);
-    const apagados = await new RetentionService(db as any, {} as any, {} as any).purgeStaleRefreshTokens();
+    ];
+    const db = fakeTokensDb(0, 0, false, linhas());
+    const apagados = await new RetentionService(db as any, retCfg() as any, {} as any).purgeStaleRefreshTokens();
     const restam = db.rows.map((r) => r.id).sort().join(',');
-    check('apaga o revogado há mais de 1 dia; preserva o revogado recente (detecta reuso) e o ativo antigo', apagados === 1 && restam === 'ativo-velho,rev-recente', `apagados=${apagados}, restam=${restam}`);
+    check('janela padrão (1 h): apaga os revogados há mais de 1 h; preserva os revogados recentes (detecta reuso) e o ativo antigo', apagados === 2 && restam === 'ativo-velho,rev-40min,rev-recente', `apagados=${apagados}, restam=${restam}`);
+
+    const db24 = fakeTokensDb(0, 0, false, linhas());
+    const apagados24 = await new RetentionService(db24 as any, retCfg(86_400_000) as any, {} as any).purgeStaleRefreshTokens();
+    check('janela configurável (REFRESH_REVOKED_RETENTION_MS=24 h): só o revogado de 3 dias é apagado', apagados24 === 1 && db24.rows.length === 4 && !db24.rows.some((r) => r.id === 'rev-velho'), `apagados=${apagados24}`);
+
+    const dbSem = fakeTokensDb(0, 0, false, linhas());
+    const apagadosSem = await new RetentionService(dbSem as any, { get: () => undefined } as any, {} as any).purgeStaleRefreshTokens();
+    check('sem a config, cai no padrão de 1 hora', apagadosSem === 2);
+
+    const cfgMin = (process.env.REFRESH_REVOKED_RETENTION_MS = '5', configuration().jwt.revokedRefreshRetentionMs);
+    const cfgLixo = (process.env.REFRESH_REVOKED_RETENTION_MS = 'abc', configuration().jwt.revokedRefreshRetentionMs);
+    delete process.env.REFRESH_REVOKED_RETENTION_MS;
+    check('valor absurdo: 5 ms sobe para o mínimo de 1 min; texto inválido volta para 1 h', cfgMin === 60_000 && cfgLixo === 3_600_000 && configuration().jwt.revokedRefreshRetentionMs === 3_600_000, `5→${cfgMin}, "abc"→${cfgLixo}`);
   }
   {
     const db = fakeTokensDb(0, 10);
-    const apagados = await new RetentionService(db as any, {} as any, {} as any).purgeStaleRefreshTokens();
+    const apagados = await new RetentionService(db as any, retCfg() as any, {} as any).purgeStaleRefreshTokens();
     check('sem expirados: não apaga nada e não faz DELETE', apagados === 0 && db.deletes === 0 && db.rows.length === 10);
   }
   {
     const db = fakeTokensDb(6000, 0);
-    const apagados = await new RetentionService(db as any, {} as any, {} as any).purgeStaleRefreshTokens();
+    const apagados = await new RetentionService(db as any, retCfg() as any, {} as any).purgeStaleRefreshTokens();
     check('um acúmulo grande é limitado por execução (50 lotes de 100) e o resto fica para a próxima', apagados === 5000 && db.rows.length === 1000, `apagados=${apagados}, restam=${db.rows.length}`);
   }
   {
     const db = fakeTokensDb(10, 0, true);
     let lancou = false;
     let apagados = -1;
-    try { apagados = await new RetentionService(db as any, {} as any, {} as any).purgeStaleRefreshTokens(); } catch { lancou = true; }
+    try { apagados = await new RetentionService(db as any, retCfg() as any, {} as any).purgeStaleRefreshTokens(); } catch { lancou = true; }
     check('erro do banco ao listar: não lança e não apaga nada', !lancou && apagados === 0 && db.rows.length === 10);
   }
 

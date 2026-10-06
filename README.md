@@ -953,6 +953,7 @@ docker compose down -v              # derruba tudo
 | `TRUST_PROXY` | `true` só atrás de um proxy conhecido: faz `req.ip` vir do `X-Forwarded-For` |
 | `ENABLE_DEBUG_ENDPOINT` | `true` liga o `/api/debug/instance` (público, fora do rate limit). **Desligado por padrão** (responde 404); só o `docker-compose.yml` local o liga, para os testes. Nunca em produção |
 | `ALERT_WEBHOOK_URL`, `ALERT_WEBHOOK_FORMAT`, `ALERT_CHECK_INTERVAL_MS`, `ALERT_COOLDOWN_MS` | Alertas de monitoramento (ver "Monitoramento e alertas") |
+| `REFRESH_REVOKED_RETENTION_MS` | Quanto tempo um refresh token já usado fica no banco antes de o job de retenção apagá-lo (padrão 3600000 = 1 h, mínimo 1 min) |
 | `ANALYSIS_CONCURRENCY` | **Sem efeito hoje**: a concorrência do worker é fixa em 2 por réplica (o decorator é avaliado antes do `.env` carregar) |
 | `ANALYSIS_STUCK_TIMEOUT_MS` | Idade a partir da qual um documento em `processing` é reenfileirado (no boot e na varredura periódica) |
 | `ANALYSIS_RECOVERY_INTERVAL_MS` | Intervalo da varredura periódica de documentos parados (padrão 300000 = 5 min) |
@@ -1080,19 +1081,23 @@ ler menos e não deixar tabelas crescerem sem limite. Auditoria do código, e o 
 |---|---|---|
 | Checagem do aceite dos termos (guard de `/api/documents`) | 1 consulta ao banco em **toda** requisição de documentos, inclusive cada polling, sempre com o mesmo resultado para o mesmo usuário | Só o "já aceitou" fica em cache no Redis (`terms:ok:<usuário>:<versão>`, 5 min); quem não aceitou nunca é guardado; versão nova do termo invalida sozinha. Medido ao vivo: a chave aparece no Redis com TTL de 299 s |
 | Polling de status (a tela consulta enquanto o documento está pendente) | A cada 4 s, 2 a 3 leituras por consulta | Intervalo crescente (`frontend/src/lib/polling.ts`): 4 s nas 5 primeiras, 8 s nas 5 seguintes, 15 s depois, 30 s com a aba oculta. Numa análise de 100 s: 25 → 12 consultas (52% a menos). Medido no navegador: 4,6 s, 8,3 s (5 vezes), 15,4 s, e 30,4 s com a aba oculta |
-| Tabela `refresh_tokens` | **Só crescia**: cada renovação de sessão grava uma linha e nada apagava (até ~670 linhas por usuário ativo, 7 dias de rotações) | O job de retenção (a cada hora) apaga em lotes de 100 (até 50 lotes por passada) os **expirados** e os **revogados há mais de 1 dia**; um revogado só precisa existir para o reuso dele ser detectado como roubo, e essa janela passa a ser de ~1 dia. Cai para até ~100 linhas por usuário ativo. Índices na migração 004. Medido ao vivo (versão anterior): 250 expirados apagados pelo PostgREST real, válidos preservados |
+| Tabela `refresh_tokens` | **Só crescia**: cada renovação de sessão grava uma linha e nada apagava (até ~670 linhas por usuário ativo, 7 dias de rotações) | O job de retenção (a cada hora) apaga em lotes de 100 (até 50 lotes por passada) os **expirados** e os **revogados há mais de 1 hora** (`REFRESH_REVOKED_RETENTION_MS`, padrão 3600000, mínimo 1 min); um revogado só precisa existir para o reuso dele ser detectado como roubo, e essa janela é de ~1 h. Como o job roda de hora em hora, cada linha revogada vive de 1 a 2 h: com a sessão renovada a cada 15 min isso dá **até ~10 linhas por usuário ativo** (eram até ~670 sem limpeza; ~100 com a janela de 1 dia). Índices na migração 004 (já aplicada). Medido ao vivo: 250 expirados apagados pelo PostgREST real, válidos preservados, revogado de 2 h atrás apagado e o de 10 min atrás preservado |
 | Varredura de documentos parados e retenção de 72h | Já usam índices (`idx_documents_pendentes`, `idx_documents_retencao`) | Sem mudança |
 
 **O que continua pesando** (não resolvido):
 - Cada consulta de polling ainda faz 1 a 2 leituras (o documento e, na tela de detalhe, a análise). Com
   muitos usuários esperando ao mesmo tempo isso continua sendo a maior fonte de leitura. A saída seria um
   cache curto do status ou notificação por servidor (SSE/WebSocket), que não foi feita.
-- `refresh_tokens` ainda guarda uma linha por renovação por cerca de 1 dia (até ~100 por usuário ativo com a
+- `refresh_tokens` ainda guarda uma linha por renovação por 1 a 2 horas (até ~10 por usuário ativo com a
   sessão renovada a cada 15 min). Guardar uma linha por renovação **não é necessário**: o desenho mínimo é
   uma linha por sessão, atualizada no lugar (hash atual e hash anterior; o `UPDATE ... WHERE hash = ...`
   já é a reivindicação atômica). Isso exige mudar a tabela e o código de autenticação (migração nova) e não
-  foi feito. Aumentar `JWT_ACCESS_EXPIRES_IN` também reduz as linhas, à custa de uma janela maior para um
-  access token roubado.
+  foi feito. **Decisão de segurança:** não aumentei `JWT_ACCESS_EXPIRES_IN` (segue 15 min). Subir para 60 min
+  reduziria as renovações em ~4×, mas um access token roubado não pode ser revogado e passaria a valer 4×
+  mais; com a janela de 1 h o ganho já veio sem esse custo. **Efeito colateral da janela curta:** o reuso de
+  um refresh token revogado há mais de ~1 h deixa de derrubar a sessão inteira (ele continua sendo recusado
+  com 401, só não aciona a revogação da família nem o log `refresh_token_reuse_detected`). Se preferir
+  detectar por mais tempo, aumente `REFRESH_REVOKED_RETENTION_MS`.
 - `audit_logs` só cresce (login, upload, exclusão); não há retenção.
 - Nada disso foi testado com carga real: os números acima são contas sobre o código e medidas pontuais.
 
@@ -1144,11 +1149,23 @@ alertas só aparecem no log (`ALERTA [CRÍTICO] ...`), e a validação de produ�
 | `ALERT_COOLDOWN_MS` | Quanto tempo um alerta que continua disparado fica sem ser repetido (padrão 1800000 = 30 min) |
 
 **Monitor externo de disponibilidade (necessário):** se o app inteiro cair, o job de alertas cai junto e não
-avisa ninguém. Configure no seu provedor (ou em qualquer serviço de uptime) uma checagem periódica em
-`GET /api/health/ready`, que responde `200` (Redis e banco ok) ou `503` (algum deles fora) em até ~2 s, mais
-um alerta quando ela falhar. O `/api/health` continua sendo só a vida do processo (healthcheck do container).
-O endpoint tem cache de 5 s por réplica e está sujeito a abuso como qualquer rota pública: use um intervalo de
-30 s a 1 min.
+avisa ninguém. O repositório traz um monitor que roda **fora** da sua infraestrutura:
+
+- `backend/scripts/uptime-check.js` (sem dependências): consulta `GET /api/health/ready` (`200` = Redis e banco
+  ok; `503` = algum fora; sem resposta = app/VM/Nginx fora), tenta 3 vezes com 10 s de intervalo antes de
+  dar a queda como real (oscilação de 1 ou 2 tentativas não alerta), avisa pelo **mesmo webhook** e formato
+  dos alertas internos e sai com código 1 quando está fora. Com `UPTIME_STATE_FILE` o aviso sai **uma vez por
+  queda** e sai o "resolvido" na volta.
+- `.github/workflows/uptime.yml`: agenda o script a cada 5 min no GitHub Actions (guarda o estado no cache do
+  Actions). Para ligar, no repositório (Settings → Secrets and variables → Actions): variável `HEALTH_URL`
+  (`https://SEU-DOMINIO/api/health/ready`), secret `ALERT_WEBHOOK_URL` e, opcional, variável
+  `ALERT_WEBHOOK_FORMAT`. Sem `HEALTH_URL` o workflow não faz nada. Limites do GitHub: intervalo mínimo de
+  5 min, agendamento "melhor esforço" (pode atrasar) e, em repositório público, workflows agendados são
+  desativados após 60 dias sem atividade no repositório. Para checar a cada 1 min, use um monitor dedicado
+  (qualquer serviço de uptime) apontado para a mesma URL, esperando `200`; ele pode conviver com este.
+
+O `/api/health` continua sendo só a vida do processo (healthcheck do container). O `/api/health/ready` tem
+cache de 5 s por réplica e é público como qualquer rota: use intervalo de 30 s ou mais.
 
 ### Etapa 5 — Retenção de 72h como job repetível
 
@@ -1208,14 +1225,15 @@ entre elas e o limite de login vale somado.
 | `backend/scripts/test-redis-tls.sh` | O backend contra um **Redis com TLS e senha** (certificados descartáveis, containers temporários): conexão `rediss://`, contador, rate limit, schedulers e um job consumido pelo worker do BullMQ, `/api/debug` desligado = 404, e três casos negativos (sem a CA, senha errada, política `allkeys-lru`) | 14 de 14 verificações passaram |
 | `backend/scripts/test-refresh-race.js` | **Ao vivo**, pela API (3 réplicas atrás do Nginx): N chamadas simultâneas a `/api/auth/refresh` com o MESMO cookie | Antes da correção: 8 chamadas, **5** deram certo e 5 tokens válidos sobraram. Depois: 1 dá certo e no máximo 1 token válido sobra, em 6, 12 e 18 chamadas paralelas |
 | `backend/scripts/test-frontend-single-flight.ts` (`npm run frontend-refresh:test`) | **Offline**: a renovação única do frontend (`fetch` falso que conta as chamadas) | 8 de 8: 6 renovações simultâneas = 1 requisição; 5 chamadas com token expirado = 1 renovação; sequenciais = 1 cada; a trava é liberada depois de uma falha |
-| `backend/scripts/test-db-load.ts` (`npm run db-load:test`) | **Offline**: cache dos termos (1 consulta em 5 requisições, quem não aceitou não é guardado, versão nova invalida, erro do Redis cai para o banco), limpeza de tokens em lotes a limpeza de tokens revogados antigos e o intervalo crescente do polling | 13 de 13 verificações passaram |
-| `backend/scripts/test-db-load-live.js` | **Ao vivo** (Supabase e Redis reais, 3 réplicas): a chave de cache dos termos no Redis, o 403 de quem não aceitou, e o job de retenção apagando 250 tokens expirados | 6 de 6 verificações passaram |
+| `backend/scripts/test-db-load.ts` (`npm run db-load:test`) | **Offline**: cache dos termos (1 consulta em 5 requisições, quem não aceitou não é guardado, versão nova invalida, erro do Redis cai para o banco), limpeza de tokens expirados em lotes, janela dos revogados (1 h padrão, configurável, valores absurdos corrigidos) e o intervalo crescente do polling | 16 de 16 verificações passaram |
+| `backend/scripts/test-db-load-live.js` | **Ao vivo** (Supabase e Redis reais, 3 réplicas): a chave de cache dos termos no Redis, o 403 de quem não aceitou, o job de retenção apagando 250 tokens expirados e a janela de 1 h dos revogados (some o de 2 h atrás, fica o de 10 min) | 8 de 8 verificações passaram |
 | `backend/scripts/test-register-race.js` | **Ao vivo**: 5 cadastros simultâneos com o MESMO e-mail | Antes: 1× `201` e 4× `500`. Depois: 1× `201` e 4× `409` |
 | `backend/scripts/test-multi-tab-refresh.ts` (`npm run multi-tab:test`) | **Offline**: servidor simulado (uso único, reuso derruba a família) + cookie compartilhado + várias "abas" | 4 de 4: sem o lock, 2 abas derrubam a sessão (controle); com Web Locks, 2 e 5 abas renovam todas, com 1 requisição por aba |
 | `backend/scripts/test-alerts.ts` (`npm run alerts:test`) | **Offline**: cada regra, repetição (cooldown e lembrete), "resolvido", formatos do webhook, falhas | 28 de 28 verificações passaram |
 | `backend/scripts/test-alerts-live.js` | **Ao vivo**: receptor de webhook local, documentos reais parados e com erro no Supabase, queda e volta do Redis | 10 de 10: o alerta chega, não se repete no cooldown, o "resolvido" chega, o batimento da retenção é gravado e `/api/health/ready` responde 503 com o Redis fora e volta a 200 |
 | `backend/scripts/test-resilient-throttler.ts` (`npm run throttler-resilient:test`) | **Offline**: rate limit com o Redis saudável, com erro, travado e voltando | 6 de 6 verificações passaram |
 | `backend/scripts/test-redis-down-live.js` | **Ao vivo**: derruba o Redis com 3 réplicas no ar e testa login, `/api/health`, `/api/health/ready`, rotas autenticadas e o rate limit | 8 de 8: com o Redis parado, o login responde `401` em ~1 s (antes travava), `/api/health` responde `200` em ~10 ms, `/api/health/ready` responde `503`, uma rota autenticada responde `200` (o cache de termos cai para o banco) e o rate limit continua valendo por réplica (429 na 10ª tentativa com 3 réplicas); com o Redis de volta, tudo normaliza e o contador volta a ser gravado nele |
+| `backend/scripts/test-uptime-check.js` (`npm run uptime:test`; com `LIVE=1` também contra o app real) | Monitor externo: servidor de saúde falso (200, 503, travado, porta fechada) e receptor de webhook; com `LIVE=1`, o `/api/health/ready` real com o Redis parado e religado | 13 de 13 offline; 16 de 16 com `LIVE=1`: um aviso por queda (sem repetir), "resolvido" na volta, oscilação de 2 falhas não alerta, travado estoura o timeout e não pendura, webhook fora não quebra |
 | `backend/scripts/test-e2e-http.js` | Pela API HTTP: cadastro, termos, login, 8 uploads simultâneos, leitura do resultado — sempre alternando réplicas | Tudo passou; 8 documentos, cada um processado 1× |
 | `backend/scripts/test-load-balancer.js` | Nginx: distribuição, contador, IP real e header forjado, upload grande, **dois dispositivos na mesma conta**, rate limit global, réplica morta, escala para 5 réplicas | 15 de 15 verificações passaram (distribuição 56/49/45; 0 falhas em 60 requisições com uma réplica morta; 5 réplicas usadas sem reiniciar o Nginx) |
 | Carga na camada da fila (3.000 jobs, 30.000 enqueues, 3 workers em containers separados) | O comportamento do BullMQ sob volume | 3.000 execuções exatas com a fila pausada na rajada; 286 duplicados sem pausar (ver Etapa 4). **O script não ficou no repositório** |
@@ -1236,6 +1254,7 @@ npm run db-load:test                                                  # offline,
 npm run multi-tab:test                                                # offline, não precisa de Docker
 npm run alerts:test                                                   # offline, não precisa de Docker
 npm run throttler-resilient:test                                      # offline, não precisa de Docker
+npm run uptime:test                                                   # offline (LIVE=1 também contra o Compose de teste)
 node backend/scripts/test-register-race.js                            # ao vivo; precisa do Nginx em :8080
 node backend/scripts/test-alerts-live.js                              # ao vivo; precisa do Compose de teste (webhook em :9099)
 node backend/scripts/test-redis-down-live.js                          # ao vivo; derruba e religa o Redis do Compose
@@ -1399,6 +1418,9 @@ gerenciado, não um container.
 5. **Antes de ir:** subir uma vez com a validação de produção (ela lista o que está
    errado), rever as limitações acima e alertar sobre jobs falhos e documentos
    parados em `processing`.
+6. **Ligar o monitor externo:** definir `ALERT_WEBHOOK_URL` no `.env.production` e, no GitHub, a variável
+   `HEALTH_URL` e o secret `ALERT_WEBHOOK_URL` (ver "Monitoramento e alertas"). Testar uma vez parando
+   o Redis (ou apontando `HEALTH_URL` para um endereço errado) para ver o aviso chegar.
 
 ---
 
