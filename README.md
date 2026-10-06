@@ -946,7 +946,8 @@ docker compose down -v              # derruba tudo
 | `REDIS_URL` | Conexão com o Redis (rate limit, cache, BullMQ). Em produção, `rediss://` (TLS) com senha |
 | `TRUST_PROXY` | `true` só atrás de um proxy conhecido: faz `req.ip` vir do `X-Forwarded-For` |
 | `ANALYSIS_CONCURRENCY` | **Sem efeito hoje**: a concorrência do worker é fixa em 2 por réplica (o decorator é avaliado antes do `.env` carregar) |
-| `ANALYSIS_STUCK_TIMEOUT_MS` | Idade a partir da qual um documento em `processing` é reenfileirado no boot |
+| `ANALYSIS_STUCK_TIMEOUT_MS` | Idade a partir da qual um documento em `processing` é reenfileirado (no boot e na varredura periódica) |
+| `ANALYSIS_RECOVERY_INTERVAL_MS` | Intervalo da varredura periódica de documentos parados (padrão 300000 = 5 min) |
 
 ### Etapa 1 — Cliente Redis compartilhado
 
@@ -996,6 +997,18 @@ qualquer worker processa, uma réplica por job.
   espera, porque essa gravação é a única coisa que tira o documento de
   `processing`. Sem isso, o job sumia da fila e o documento ficava preso para
   sempre (defeito real, encontrado nos testes abaixo).
+
+- **Tentativas ao gravar o status:** toda gravação em `documents` feita pelo
+  worker (`processing`, `done`, `error`) tenta até 3 vezes (espera de 3 s e 6 s)
+  antes de desistir.
+- **Varredura periódica** (job repetível `recuperar-pendentes`, a cada
+  `ANALYSIS_RECOVERY_INTERVAL_MS`): reenfileira documentos parados em
+  `processing` há mais de `ANALYSIS_STUCK_TIMEOUT_MS` ou em `uploaded` há mais de
+  2 min. É a última rede de segurança: cobre o caso em que o banco estava fora
+  quando a análise terminou e nenhuma gravação de status funcionou, e o job já
+  tinha ido embora da fila. O `jobId` evita duplicar um job que ainda está ativo.
+  Todas as réplicas registram o mesmo scheduler (idempotente). Por isso a fila
+  mostra sempre 1 job `delayed` (o próximo disparo da varredura).
 
 **Duplicatas — o que a fila garante e o que não garante.** O Redis só aceita um
 job novo se não existir outro com o mesmo `jobId`. Como o job é apagado ao
@@ -1060,17 +1073,22 @@ entre elas e o limite de login vale somado.
 |---|---|---|
 | `backend/scripts/test-queue-race.ts` | 6 a 20 documentos reais, cada um enfileirado 15× ao mesmo tempo por 3 produtores independentes, 3 réplicas consumindo; replay de documentos `done`; com `--kill`, mata uma réplica no meio da análise | Cada documento processado exatamente 1×, 0 linhas duplicadas em `analyses`, 0 reanálises no replay; com a réplica morta, todos terminaram (20 docs / 300 enqueues: 18 `done`, 2 `error` por resposta da IA fora do schema) |
 | `backend/scripts/test-double-stall.ts` | Mata duas réplicas em sequência durante a análise do mesmo documento | Antes da correção: documento preso em `processing`. Depois: `error` com a mensagem ao usuário |
+| `backend/scripts/test-status-retry.ts` (`npm run status-retry:test`) | **Offline** (sem Redis/Supabase/IA): simula o banco falhando ao gravar o status e confere as tentativas, a seleção da varredura e o handler de `failed` | 9 de 9 verificações passaram |
+| `backend/scripts/test-recovery-sweep.ts` | **Ao vivo**: cria um documento `processing` há 15 min e outro `uploaded` há 10 min, sem nenhum job na fila, e deixa o scheduler resgatá-los | 5 de 5: um único scheduler apesar de 3 réplicas; os dois documentos concluídos; cada um processado 1× |
 | `backend/scripts/test-e2e-http.js` | Pela API HTTP: cadastro, termos, login, 8 uploads simultâneos, leitura do resultado — sempre alternando réplicas | Tudo passou; 8 documentos, cada um processado 1× |
 | `backend/scripts/test-load-balancer.js` | Nginx: distribuição, contador, IP real e header forjado, upload grande, **dois dispositivos na mesma conta**, rate limit global, réplica morta, escala para 5 réplicas | 15 de 15 verificações passaram (distribuição 56/49/45; 0 falhas em 60 requisições com uma réplica morta; 5 réplicas usadas sem reiniciar o Nginx) |
 | Carga na camada da fila (3.000 jobs, 30.000 enqueues, 3 workers em containers separados) | O comportamento do BullMQ sob volume | 3.000 execuções exatas com a fila pausada na rajada; 286 duplicados sem pausar (ver Etapa 4). **O script não ficou no repositório** |
 
 ```bash
-# queue-race e double-stall rodam no host e precisam do Redis exposto:
+# queue-race, double-stall e recovery-sweep rodam no host e precisam do Redis exposto
+# (o override de teste também encurta a varredura periódica para 30 s):
 docker compose -f docker-compose.yml -f docker-compose.test.yml up -d --build
 cd backend
 TS_NODE_FILES=true npx ts-node scripts/test-queue-race.ts            # N_DOCS=20 para o teste maior
 TS_NODE_FILES=true npx ts-node scripts/test-queue-race.ts --kill     # derruba uma réplica no meio
 TS_NODE_FILES=true npx ts-node scripts/test-double-stall.ts          # mata 2 réplicas (religa no fim)
+TS_NODE_FILES=true npx ts-node scripts/test-recovery-sweep.ts        # varredura de documentos parados (intervalo de 30 s do override)
+npm run status-retry:test                                             # offline, não precisa de Docker
 cd ..
 node backend/scripts/test-load-balancer.js                           # precisa do Nginx em :8080; leva alguns minutos
 # e2e pela API, dentro da rede do Compose:
@@ -1081,19 +1099,21 @@ docker compose run --rm --no-deps -T -e NODE_PATH=/app/node_modules \
 
 Todos usam o Supabase e o OpenRouter reais, criam um usuário de teste e **apagam
 os dados que criaram**. Se um deles for interrompido no meio, a limpeza pode não
-rodar: confira o Supabase por usuários `race-test+`, `stall-test+`, `e2e-http+`
-ou `lb-test+`.
+rodar: confira o Supabase por usuários `race-test+`, `stall-test+`, `sweep-test+`,
+`e2e-http+` ou `lb-test+`.
 
 ### Limitações conhecidas
 
-- **Documento preso se o banco estiver fora quando a análise falha.** Se a
-  análise falha e a gravação de `status = 'error'` também falha (queda de rede),
-  o `setStatus` só registra em log e o job termina "com sucesso": o documento
-  fica em `processing` e nada o recupera, porque o job não falhou e a rede de
-  segurança da Etapa 4 não dispara. Visto uma vez, durante uma queda de rede
-  (5 de 6 documentos). **Não corrigido.**
-- `recoverPending()` roda só no boot e só pega documentos parados há mais de
-  `ANALYSIS_STUCK_TIMEOUT_MS` (10 min por padrão); não há varredura periódica.
+- **Documento parado se o banco estiver fora quando a análise falha** —
+  *resolvido*. A falha de gravação do status tentava uma vez e só logava (visto
+  durante uma queda de rede: 5 de 6 documentos ficaram em `processing`). Agora
+  são 3 tentativas e, se todas falharem, a varredura periódica reenfileira o
+  documento depois de `ANALYSIS_STUCK_TIMEOUT_MS`. **Resíduo:** nessa situação o
+  usuário vê "processando" por até ~10 a 15 min (prazo de parado + intervalo da
+  varredura) até o documento ser reanalisado automaticamente.
+- A varredura reanalisa um documento parado do zero (chama a IA de novo). Se a
+  análise já tinha sido gravada em `analyses` e só a gravação do `done` falhou,
+  essa chamada é desperdiçada (o `upsert` mantém o resultado único).
 - Concorrência do worker fixa em 2 por réplica.
 - O volume de milhares de jobs foi testado só na camada da fila; o processador
   real com Supabase foi testado até 20 documentos (o OpenRouter gratuito não
@@ -1127,9 +1147,8 @@ gerenciado, não um container.
    (`trust proxy 1`) tem de bater com a topologia (CDN + LB contam como mais de um).
 4. **`NODE_ENV=production` exige HTTPS:** o cookie do refresh token passa a ser
    `secure`. Localmente o container usa `NODE_ENV=development` (vem do `.env`).
-5. **Antes de ir:** remover ou proteger `/api/debug/instance`, tratar as limitações
-   acima (principalmente a do documento preso) e alertar sobre jobs falhos e
-   documentos parados em `processing`.
+5. **Antes de ir:** remover ou proteger `/api/debug/instance`, rever as limitações
+   acima e alertar sobre jobs falhos e documentos parados em `processing`.
 
 ---
 
@@ -1172,9 +1191,7 @@ hoje.
 - **Migração da escalabilidade para produção** (planejada, não implementada):
   Redis gerenciado, réplicas reais atrás do load balancer do provedor, e o
   tratamento das limitações listadas em "Escalabilidade horizontal" —
-  principalmente o documento que pode ficar preso em `processing` se o banco
-  estiver fora no momento em que a análise falha. O passo a passo está em
-  "Migrar para produção — plano".
+  que sobraram. O passo a passo está em "Migrar para produção — plano".
 
 - **Fase 10** — Polimento e Deploy: deploy do backend (Railway/Render/Fly.io)
   e do frontend (Vercel), monitoramento básico (logs de erro, alertas de

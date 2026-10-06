@@ -1,6 +1,9 @@
-# Override SÓ para testes: expõe o Redis do Compose em localhost:6379, para os
-# scripts que rodam no host (backend/scripts/test-queue-race.ts e
-# test-double-stall.ts) enfileirarem direto nele.
+# Override SÓ para testes:
+#  - expõe o Redis do Compose em localhost:6379, para os scripts que rodam no
+#    host (backend/scripts/test-queue-race.ts, test-double-stall.ts e
+#    test-recovery-sweep.ts) enfileirarem/inspecionarem direto nele;
+#  - encurta a varredura periódica de documentos parados para 30 s (em
+#    produção o padrão é 5 min), para o teste não esperar minutos.
 #
 #   docker compose -f docker-compose.yml -f docker-compose.test.yml up -d --build
 #
@@ -10,3 +13,6 @@ services:
   redis:
     ports:
       - "6379:6379"
+  backend:
+    environment:
+      ANALYSIS_RECOVERY_INTERVAL_MS: "30000"

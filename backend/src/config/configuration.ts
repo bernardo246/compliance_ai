@@ -65,6 +65,8 @@ export default () => ({
     // Um documento preso em 'processing' há mais que isto (ex.: o processo caiu
     // no meio de uma análise) é reenfileirado na próxima subida do backend.
     stuckTimeoutMs: parseInt(process.env.ANALYSIS_STUCK_TIMEOUT_MS ?? '600000', 10),
+    // Intervalo da varredura periódica de documentos parados (job repetível do BullMQ).
+    recoveryIntervalMs: parseInt(process.env.ANALYSIS_RECOVERY_INTERVAL_MS ?? '300000', 10),
   },
 
   openrouter: {

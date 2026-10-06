@@ -6,7 +6,13 @@ import { SupabaseService } from '../common/supabase/supabase.service';
 import { AreaNegocio } from '../documents/dto/upload-document.dto';
 import { TipoDocumento } from '../documents/documents.types';
 import { AnalysisService } from './analysis.service';
-import { ANALISES_QUEUE, AnalisarJobData } from './analysis-queue.service';
+import {
+  ANALISES_QUEUE,
+  AnalisarJobData,
+  AnalysisQueueService,
+  RECUPERAR_JOB,
+  RECUPERAR_UPLOADED_MIN_AGE_MS,
+} from './analysis-queue.service';
 
 interface PendingDocument {
   id: string;
@@ -34,15 +40,27 @@ export class AnalysisProcessor extends WorkerHost {
     private readonly supabase: SupabaseService,
     private readonly config: ConfigService,
     private readonly analysisService: AnalysisService,
+    private readonly queueService: AnalysisQueueService,
   ) {
     super();
   }
+
+  // Espera base entre tentativas de gravar no banco (3s, 6s...). Campo (e não
+  // constante) para o teste offline poder encurtar.
+  private retryBaseMs = 3000;
 
   private db() {
     return this.supabase.getClient();
   }
 
   async process(job: Job<AnalisarJobData>): Promise<void> {
+    if (job.name === RECUPERAR_JOB) {
+      // Varredura periódica de documentos parados (agendada pelo
+      // AnalysisQueueService): rede de segurança para quando uma gravação de
+      // status falhou e nenhum job ficou para trás.
+      await this.queueService.recoverPending(RECUPERAR_UPLOADED_MIN_AGE_MS, 'varredura periódica');
+      return;
+    }
     await this.run(job.data.documentId);
   }
 
@@ -61,31 +79,13 @@ export class AnalysisProcessor extends WorkerHost {
     this.logger.error(
       `Job de análise do documento ${documentId} falhou definitivamente: ${err.message}`,
     );
-    // Algumas tentativas: o banco pode estar indisponível por instantes, e
-    // esta gravação é a única coisa que tira o documento de 'processing'.
-    const maxTentativas = 3;
-    let ultimoErro = '';
-    for (let tentativa = 1; tentativa <= maxTentativas; tentativa++) {
-      try {
-        const { error } = await this.db()
-          .from('documents')
-          .update({
-            status: 'error',
-            erro: 'A análise foi interrompida por uma falha no servidor antes de terminar. Envie o documento novamente.',
-          })
-          .eq('id', documentId)
-          .in('status', ['uploaded', 'processing']);
-        if (!error) return;
-        ultimoErro = error.message;
-      } catch (e) {
-        ultimoErro = e instanceof Error ? e.message : String(e);
-      }
-      if (tentativa < maxTentativas) {
-        await new Promise((r) => setTimeout(r, 3000 * tentativa));
-      }
-    }
-    this.logger.error(
-      `Falha ao marcar o documento ${documentId} como 'error' após ${maxTentativas} tentativas: ${ultimoErro}`,
+    await this.updateDocument(
+      documentId,
+      {
+        status: 'error',
+        erro: 'A análise foi interrompida por uma falha no servidor antes de terminar. Envie o documento novamente.',
+      },
+      ['uploaded', 'processing'],
     );
   }
 
@@ -183,15 +183,44 @@ export class AnalysisProcessor extends WorkerHost {
     status: 'processing' | 'done' | 'error',
     extra: Record<string, unknown> = {},
   ): Promise<void> {
-    const { error } = await this.db()
-      .from('documents')
-      .update({ status, ...extra })
-      .eq('id', documentId);
+    await this.updateDocument(documentId, { status, ...extra });
+  }
 
-    if (error) {
-      this.logger.error(
-        `Falha ao atualizar status do documento ${documentId} para '${status}': ${error.message}`,
-      );
+  /**
+   * Grava em `documents` com algumas tentativas: o banco pode ficar fora do ar
+   * por instantes, e estas gravações são o que tira o documento de
+   * 'processing'. Se todas falharem, só registra o erro (não relança): o job
+   * termina e a varredura periódica (RECUPERAR_JOB) reenfileira o documento
+   * quando ele passar de ANALYSIS_STUCK_TIMEOUT_MS parado.
+   * `onlyIfStatus` restringe a gravação a documentos ainda nesses estados
+   * (para nunca sobrescrever um 'done').
+   */
+  private async updateDocument(
+    documentId: string,
+    patch: Record<string, unknown>,
+    onlyIfStatus?: string[],
+  ): Promise<boolean> {
+    const maxTentativas = 3;
+    let ultimoErro = '';
+    for (let tentativa = 1; tentativa <= maxTentativas; tentativa++) {
+      try {
+        let query = this.db().from('documents').update(patch).eq('id', documentId);
+        if (onlyIfStatus) query = query.in('status', onlyIfStatus);
+        const { error } = await query;
+        if (!error) return true;
+        ultimoErro = error.message;
+      } catch (e) {
+        ultimoErro = e instanceof Error ? e.message : String(e);
+      }
+      if (tentativa < maxTentativas) {
+        await new Promise((r) => setTimeout(r, this.retryBaseMs * tentativa));
+      }
     }
+    this.logger.error(
+      `Falha ao atualizar o documento ${documentId} (${JSON.stringify(
+        patch.status ?? Object.keys(patch),
+      )}) após ${maxTentativas} tentativas: ${ultimoErro}`,
+    );
+    return false;
   }
 }
