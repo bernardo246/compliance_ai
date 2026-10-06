@@ -1,0 +1,33 @@
+# Modelo de PRODUÇÃO — roda só o backend, contra um Redis GERENCIADO (rediss://)
+# e o Supabase. Sem Redis e sem Nginx aqui: em produção o Redis é um serviço do
+# provedor e o load balancer também.
+#
+# Serve para (1) testar a imagem de produção na sua máquina antes do deploy e
+# (2) como referência das opções (a maioria dos provedores — Railway, Render,
+# Fly.io — roda a imagem direto, sem Compose, com as variáveis no painel).
+#
+#   cp backend/.env.production.example backend/.env.production   # e preencha
+#   docker compose -f docker-compose.prod.yml up -d --build
+#
+# Para usar uma imagem já publicada no registry em vez de buildar:
+#   BACKEND_IMAGE=registry.exemplo.com/compliance-backend:1.0.0 \
+#     docker compose -f docker-compose.prod.yml up -d --no-build
+
+services:
+  backend:
+    build: ./backend
+    image: ${BACKEND_IMAGE:-compliance-backend:prod}
+    env_file: ./backend/.env.production
+    restart: unless-stopped
+    # Só em localhost: quem expõe o serviço ao mundo é o load balancer do provedor.
+    ports:
+      - "127.0.0.1:3001:3001"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3001/api/health"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+      start_period: 20s
+    # Limites de recurso: o upload bufferiza o arquivo em memória (até 20 MB).
+    mem_limit: 768m
+    cpus: 1.0

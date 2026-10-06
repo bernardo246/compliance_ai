@@ -87,6 +87,7 @@ projeto-analise-ia/
 ├── nginx/nginx.conf        # Escalabilidade — load balancer na frente das réplicas
 ├── docker-compose.yml      # Escalabilidade — Redis + N réplicas do backend + Nginx (porta 8080)
 ├── docker-compose.test.yml # Override só p/ testes: expõe o Redis em localhost:6379
+├── docker-compose.prod.yml # Modelo de produção: só o backend, contra Redis gerenciado (rediss://)
 └── frontend/               # Next.js 16 (App Router)
     └── src/
         ├── app/
@@ -945,6 +946,7 @@ docker compose down -v              # derruba tudo
 |---|---|
 | `REDIS_URL` | Conexão com o Redis (rate limit, cache, BullMQ). Em produção, `rediss://` (TLS) com senha |
 | `TRUST_PROXY` | `true` só atrás de um proxy conhecido: faz `req.ip` vir do `X-Forwarded-For` |
+| `ENABLE_DEBUG_ENDPOINT` | `true` liga o `/api/debug/instance` (público, fora do rate limit). **Desligado por padrão** (responde 404); só o `docker-compose.yml` local o liga, para os testes. Nunca em produção |
 | `ANALYSIS_CONCURRENCY` | **Sem efeito hoje**: a concorrência do worker é fixa em 2 por réplica (o decorator é avaliado antes do `.env` carregar) |
 | `ANALYSIS_STUCK_TIMEOUT_MS` | Idade a partir da qual um documento em `processing` é reenfileirado (no boot e na varredura periódica) |
 | `ANALYSIS_RECOVERY_INTERVAL_MS` | Intervalo da varredura periódica de documentos parados (padrão 300000 = 5 min) |
@@ -974,8 +976,9 @@ backend, a primeira requisição já veio `429` (o contador não está na memór
 `INCR`, atômico) e `GET /api/debug/instance`, que devolve `instanceId` (o
 `HOSTNAME` do container), `hits` (contador no Redis), `ip` (o `req.ip` do rate
 limit) e `timestamp`. É `@Public` e fora do rate limit de propósito (os testes
-mandam centenas de requisições por minuto). **Remover ou proteger antes de
-produção.** **Provado:** dois backends alternando 5 chamadas → `hits` 1, 2, 3, 4, 5.
+mandam centenas de requisições por minuto), por isso fica **desligado por
+padrão**: sem `ENABLE_DEBUG_ENDPOINT=true` responde `404`, como se a rota não
+existisse. Só o `docker-compose.yml` local o liga. **Provado:** dois backends alternando 5 chamadas → `hits` 1, 2, 3, 4, 5.
 
 ### Etapa 4 — Fila de análise no BullMQ
 
@@ -1073,8 +1076,11 @@ entre elas e o limite de login vale somado.
 |---|---|---|
 | `backend/scripts/test-queue-race.ts` | 6 a 20 documentos reais, cada um enfileirado 15× ao mesmo tempo por 3 produtores independentes, 3 réplicas consumindo; replay de documentos `done`; com `--kill`, mata uma réplica no meio da análise | Cada documento processado exatamente 1×, 0 linhas duplicadas em `analyses`, 0 reanálises no replay; com a réplica morta, todos terminaram (20 docs / 300 enqueues: 18 `done`, 2 `error` por resposta da IA fora do schema) |
 | `backend/scripts/test-double-stall.ts` | Mata duas réplicas em sequência durante a análise do mesmo documento | Antes da correção: documento preso em `processing`. Depois: `error` com a mensagem ao usuário |
+| **Frontend no navegador atrás do Nginx** (manual: `NEXT_PUBLIC_API_URL=http://localhost:8080 npm run dev` em `frontend/`, com o Compose local no ar) | Fluxo real de usuário: cadastro, aceite de termos, recarregar a página (a sessão volta pelo cookie `httpOnly` via `/api/auth/refresh`), upload de um PDF, polling do status na lista, tela de erro, tela de resultado, sair e entrar de novo | Tudo funcionou: todas as chamadas passaram por `localhost:8080` com CORS (preflight `204`), sem erro de CORS no console; o upload foi processado por uma réplica, a lista atualizou sozinha de "Processando" para "Concluído" e o resultado mostrou resumo, selo de conformidade e checklist de 23 itens. Um documento terminou em "Erro" por resposta da IA fora do schema (a falha conhecida do modelo gratuito), e a tela mostrou a mensagem com o convite a reenviar |
 | `backend/scripts/test-status-retry.ts` (`npm run status-retry:test`) | **Offline** (sem Redis/Supabase/IA): simula o banco falhando ao gravar o status e confere as tentativas, a seleção da varredura e o handler de `failed` | 9 de 9 verificações passaram |
 | `backend/scripts/test-recovery-sweep.ts` | **Ao vivo**: cria um documento `processing` há 15 min e outro `uploaded` há 10 min, sem nenhum job na fila, e deixa o scheduler resgatá-los | 5 de 5: um único scheduler apesar de 3 réplicas; os dois documentos concluídos; cada um processado 1× |
+| `backend/scripts/test-production-checks.ts` (`npm run prod-checks:test`) | **Offline**: a validação de configuração de produção — cada regra, o que é erro (aborta o boot) e o que é só aviso, e que fora de produção ela não interfere | 17 de 17 verificações passaram |
+| `backend/scripts/test-redis-tls.sh` | O backend contra um **Redis com TLS e senha** (certificados descartáveis, containers temporários): conexão `rediss://`, contador, rate limit, schedulers e um job consumido pelo worker do BullMQ, `/api/debug` desligado = 404, e três casos negativos (sem a CA, senha errada, política `allkeys-lru`) | 14 de 14 verificações passaram |
 | `backend/scripts/test-e2e-http.js` | Pela API HTTP: cadastro, termos, login, 8 uploads simultâneos, leitura do resultado — sempre alternando réplicas | Tudo passou; 8 documentos, cada um processado 1× |
 | `backend/scripts/test-load-balancer.js` | Nginx: distribuição, contador, IP real e header forjado, upload grande, **dois dispositivos na mesma conta**, rate limit global, réplica morta, escala para 5 réplicas | 15 de 15 verificações passaram (distribuição 56/49/45; 0 falhas em 60 requisições com uma réplica morta; 5 réplicas usadas sem reiniciar o Nginx) |
 | Carga na camada da fila (3.000 jobs, 30.000 enqueues, 3 workers em containers separados) | O comportamento do BullMQ sob volume | 3.000 execuções exatas com a fila pausada na rajada; 286 duplicados sem pausar (ver Etapa 4). **O script não ficou no repositório** |
@@ -1089,6 +1095,8 @@ TS_NODE_FILES=true npx ts-node scripts/test-queue-race.ts --kill     # derruba u
 TS_NODE_FILES=true npx ts-node scripts/test-double-stall.ts          # mata 2 réplicas (religa no fim)
 TS_NODE_FILES=true npx ts-node scripts/test-recovery-sweep.ts        # varredura de documentos parados (intervalo de 30 s do override)
 npm run status-retry:test                                             # offline, não precisa de Docker
+npm run prod-checks:test                                              # offline, não precisa de Docker
+bash backend/scripts/test-redis-tls.sh                                # Docker + openssl; precisa de `npm run build` antes
 cd ..
 node backend/scripts/test-load-balancer.js                           # precisa do Nginx em :8080; leva alguns minutos
 # e2e pela API, dentro da rede do Compose:
@@ -1124,31 +1132,89 @@ rodar: confira o Supabase por usuários `race-test+`, `stall-test+`, `sweep-test
 - Pelo Docker Desktop (Mac), todo acesso do host aparece como `192.168.65.1`, então
   clientes locais dividem o mesmo limite de IP. Atrás de um load balancer de
   provedor o IP deve ser o real, mas isso só se confirma com deploy.
-- `/api/debug/instance` é público e fora do rate limit.
+- `/api/debug/instance` é público e fora do rate limit quando ligado
+  (`ENABLE_DEBUG_ENDPOINT=true`); fica desligado por padrão e a validação de
+  produção avisa se estiver ligado.
+- **Chamadas repetidas de `refresh` no frontend:** ao abrir uma página sem login, o
+  navegador faz 4 chamadas a `POST /api/auth/refresh` (todas `401`, esperadas): o
+  `reactStrictMode` do Next executa o efeito duas vezes em desenvolvimento e o cliente
+  HTTP tenta o `refresh` de novo ao receber `401`. Em produção cai para metade, mas cada
+  chamada conta no limite geral de 30 por minuto por IP dessa rota. Não foi alterado.
+- O `next dev` (Next 16) gera `frontend/AGENTS.md` e `frontend/CLAUDE.md` ao iniciar;
+  não fazem parte do projeto e não devem ser commitados.
 - Cerca de 1 em cada 10 análises do modelo gratuito termina em `error` por
   resposta fora do schema (falha da IA, não da fila).
 
-### Migrar para produção — plano (NÃO implementado)
+### Preparação para produção (feita no repositório, sem criar nada na nuvem)
+
+O que o repositório já traz para ir a produção:
+
+- **Validação de configuração no boot** (`src/config/production-checks.ts`, chamada
+  em `main.ts` antes de abrir qualquer conexão). Só age com `NODE_ENV=production`.
+  *Erros que abortam* (saída com código 1 e a lista de problemas): `SUPABASE_URL`,
+  `SUPABASE_SERVICE_ROLE_KEY`, `JWT_PRIVATE_KEY`, `JWT_PUBLIC_KEY` ou
+  `OPENROUTER_API_KEY` ausentes; `REDIS_URL` ausente, inválida ou apontando para
+  `localhost` (em produção não há Redis na própria máquina). *Avisos que não
+  abortam:* Redis sem TLS (`redis://`) ou sem senha; `FRONTEND_URL` sem `https://`
+  (o cookie `secure` do refresh token não é enviado por HTTP); `TRUST_PROXY` desligado;
+  `ENABLE_DEBUG_ENDPOINT=true`.
+- **`backend/.env.production.example`**: modelo com todas as variáveis de produção
+  (segredos como placeholders). Copie para `backend/.env.production` (ignorado pelo
+  git) ou cadastre cada variável no painel do provedor.
+- **`docker-compose.prod.yml`**: só o backend (sem Redis e sem Nginx no Compose, porque
+  em produção são serviços do provedor), `restart: unless-stopped`, porta só em
+  `127.0.0.1`, limites de memória/CPU e healthcheck. Serve para testar a imagem de
+  produção antes do deploy e como referência; a maioria dos provedores roda a imagem
+  direto, com as variáveis no painel.
+- **`/api/debug` desligado por padrão** (404).
+- **Redis com TLS e senha**: não foi preciso mudar código. O `ioredis` (e o BullMQ, que o
+  usa) entende `rediss://usuario:senha@host:porta`. Com a CA do provedor pública não há
+  nada a configurar; com uma CA própria, o Node precisa de `NODE_EXTRA_CA_CERTS`.
+- **Política de memória do Redis**: o próprio BullMQ avisa no boot se não for `noeviction`
+  (`IMPORTANT! Eviction policy is ...`).
+
+**Como foi verificado** (tudo local, com certificados e containers descartáveis):
+`npm run prod-checks:test` (17/17), `test-redis-tls.sh` (14/14) e a imagem de produção
+rodando de verdade pelo `docker-compose.prod.yml` contra um Redis com TLS e senha:
+saudável, processo como usuário `node`, `NODE_ENV=production`, **nenhum aviso de
+configuração**, conectado ao Redis por TLS, `/api/health` = 200, `/api/debug/instance` =
+404, rate limit funcionando e 16 chaves do BullMQ gravadas no Redis. Configuração quebrada
+aborta com código 1 (sem as variáveis obrigatórias, e com `REDIS_URL` em `localhost`); configuração
+só arriscada (Redis sem TLS/senha, `FRONTEND_URL` http, `TRUST_PROXY` off, debug ligado) apenas avisa.
+
+**O que NÃO foi verificado** (precisa de conta e infraestrutura reais):
+
+- Um **Redis gerenciado de verdade**. Só foi testado um Redis com TLS e senha local.
+  Provedores variam: alguns restringem comandos administrativos (o aviso de eviction
+  do BullMQ depende do `CONFIG GET`), têm limite de conexões e podem fechar conexões
+  ociosas.
+- **Load balancer, réplicas e HTTPS do provedor**, e o `TRUST_PROXY` com a topologia real
+  (o `trust proxy 1` assume um único salto).
+- Cookie `secure` por HTTPS no navegador (o teste de produção não passou por um
+  frontend em HTTPS).
+
+### Migrar para produção — passo a passo (NÃO feito)
 
 O que o Supabase já é para o banco, o Redis precisa ser para a fila: um serviço
 gerenciado, não um container.
 
 1. **Redis gerenciado** (Upstash, Redis Cloud, ElastiCache, ou o Redis do próprio
-   provedor de deploy): trocar só o `REDIS_URL`. Pontos a conferir: TLS (`rediss://`)
-   e senha na URL; persistência (AOF) ligada; `maxmemory-policy = noeviction` (o
-   BullMQ exige, senão pode perder jobs por eviction); mesma região do backend; e o
-   limite de conexões do plano — cada réplica abre várias (cliente compartilhado
-   mais as conexões do BullMQ por fila e worker).
-2. **Réplicas reais:** publicar a imagem em um registry, configurar as variáveis
-   (idealmente num secrets manager), mínimo de 2 instâncias, healthcheck em
-   `/api/health`.
+   provedor de deploy): trocar só o `REDIS_URL` por `rediss://...`. Pontos a conferir:
+   senha; persistência (AOF) ligada; `maxmemory-policy = noeviction` (o BullMQ exige,
+   senão pode perder jobs por eviction); mesma região do backend; e o limite de
+   conexões do plano — cada réplica abre várias (cliente compartilhado mais as conexões
+   do BullMQ por fila e worker).
+2. **Réplicas reais:** publicar a imagem em um registry, cadastrar as variáveis no
+   provedor (a partir do `.env.production.example`; **gere um par de chaves JWT novo**),
+   mínimo de 2 instâncias, healthcheck em `/api/health`.
 3. **Load balancer do provedor** no lugar do Nginx local (que é só simulação).
    `TRUST_PROXY=true` apenas com proxy de fato na frente, e o número de saltos
    (`trust proxy 1`) tem de bater com a topologia (CDN + LB contam como mais de um).
 4. **`NODE_ENV=production` exige HTTPS:** o cookie do refresh token passa a ser
    `secure`. Localmente o container usa `NODE_ENV=development` (vem do `.env`).
-5. **Antes de ir:** remover ou proteger `/api/debug/instance`, rever as limitações
-   acima e alertar sobre jobs falhos e documentos parados em `processing`.
+5. **Antes de ir:** subir uma vez com a validação de produção (ela lista o que está
+   errado), rever as limitações acima e alertar sobre jobs falhos e documentos
+   parados em `processing`.
 
 ---
 

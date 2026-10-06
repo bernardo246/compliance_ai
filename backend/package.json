@@ -17,6 +17,7 @@
     "pipeline:test": "TS_NODE_FILES=true ts-node scripts/test-pipeline.ts",
     "retention:test": "TS_NODE_FILES=true ts-node scripts/test-retention.ts",
     "status-retry:test": "TS_NODE_FILES=true ts-node scripts/test-status-retry.ts",
+    "prod-checks:test": "TS_NODE_FILES=true ts-node scripts/test-production-checks.ts",
     "malware-scan:test": "TS_NODE_FILES=true ts-node scripts/test-malware-scan.ts",
     "security:test": "TS_NODE_FILES=true ts-node scripts/test-security.ts"
   },

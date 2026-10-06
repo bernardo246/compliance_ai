@@ -9,6 +9,13 @@ export default () => ({
   // proxy. Sem proxy na frente (dev local), deixar desligado.
   trustProxy: process.env.TRUST_PROXY === 'true',
 
+  // Endpoint de diagnóstico /api/debug/instance (público e fora do rate limit).
+  // DESLIGADO por padrão (responde 404): só o ambiente local de várias réplicas
+  // (docker-compose.yml) o liga, para os testes de load balancer.
+  debug: {
+    enabled: process.env.ENABLE_DEBUG_ENDPOINT === 'true',
+  },
+
   supabase: {
     url: process.env.SUPABASE_URL ?? '',
     serviceRoleKey: process.env.SUPABASE_SERVICE_ROLE_KEY ?? '',

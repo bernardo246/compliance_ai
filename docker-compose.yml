@@ -34,6 +34,9 @@ services:
       # Fase 8 — o backend está atrás do Nginx: confiar no X-Forwarded-For
       # para req.ip (rate limit e auditoria) refletir o cliente, não o proxy.
       TRUST_PROXY: "true"
+      # Só o ambiente local liga o endpoint de diagnóstico /api/debug/instance
+      # (usado pelos testes de load balancer). Em produção fica desligado (404).
+      ENABLE_DEBUG_ENDPOINT: "true"
     depends_on:
       redis:
         condition: service_healthy

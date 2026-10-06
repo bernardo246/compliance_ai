@@ -5,8 +5,19 @@ import helmet from 'helmet';
 import cookieParser from 'cookie-parser';
 import { AppModule } from './app.module';
 import { HttpExceptionFilter } from './common/filters/http-exception.filter';
+import { checkProductionConfig } from './config/production-checks';
 
 async function bootstrap() {
+  // Em produção, confere a configuração ANTES de abrir qualquer conexão: erro
+  // claro e saída imediata em vez de um backend que sobe quebrado.
+  const { errors, warnings } = checkProductionConfig(process.env);
+  warnings.forEach((w) => console.warn(`[config] AVISO: ${w}`));
+  if (errors.length > 0) {
+    errors.forEach((e) => console.error(`[config] ERRO: ${e}`));
+    console.error('[config] Configuração inválida para NODE_ENV=production. Abortando.');
+    process.exit(1);
+  }
+
   const app = await NestFactory.create(AppModule);
   const config = app.get(ConfigService);
 
