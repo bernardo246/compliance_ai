@@ -1,6 +1,6 @@
 import { Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { Processor, WorkerHost } from '@nestjs/bullmq';
+import { OnWorkerEvent, Processor, WorkerHost } from '@nestjs/bullmq';
 import { Job } from 'bullmq';
 import { SupabaseService } from '../common/supabase/supabase.service';
 import { AreaNegocio } from '../documents/dto/upload-document.dto';
@@ -44,6 +44,49 @@ export class AnalysisProcessor extends WorkerHost {
 
   async process(job: Job<AnalisarJobData>): Promise<void> {
     await this.run(job.data.documentId);
+  }
+
+  /**
+   * Rede de segurança: o BullMQ falha o job de vez quando ele trava mais de
+   * uma vez (ex.: duas réplicas caem seguidas no meio da análise) e, com
+   * removeOnFail, apaga o job. Sem isto o documento ficaria em 'processing'
+   * para sempre. Só mexe em documentos ainda 'uploaded'/'processing' — nunca
+   * sobrescreve um 'done' — e é idempotente (várias réplicas podem receber).
+   */
+  @OnWorkerEvent('failed')
+  async onJobFailed(job: Job<AnalisarJobData> | undefined, err: Error): Promise<void> {
+    const documentId = job?.data?.documentId;
+    if (!documentId) return;
+
+    this.logger.error(
+      `Job de análise do documento ${documentId} falhou definitivamente: ${err.message}`,
+    );
+    // Algumas tentativas: o banco pode estar indisponível por instantes, e
+    // esta gravação é a única coisa que tira o documento de 'processing'.
+    const maxTentativas = 3;
+    let ultimoErro = '';
+    for (let tentativa = 1; tentativa <= maxTentativas; tentativa++) {
+      try {
+        const { error } = await this.db()
+          .from('documents')
+          .update({
+            status: 'error',
+            erro: 'A análise foi interrompida por uma falha no servidor antes de terminar. Envie o documento novamente.',
+          })
+          .eq('id', documentId)
+          .in('status', ['uploaded', 'processing']);
+        if (!error) return;
+        ultimoErro = error.message;
+      } catch (e) {
+        ultimoErro = e instanceof Error ? e.message : String(e);
+      }
+      if (tentativa < maxTentativas) {
+        await new Promise((r) => setTimeout(r, 3000 * tentativa));
+      }
+    }
+    this.logger.error(
+      `Falha ao marcar o documento ${documentId} como 'error' após ${maxTentativas} tentativas: ${ultimoErro}`,
+    );
   }
 
   private async run(documentId: string): Promise<void> {
