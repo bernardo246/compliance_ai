@@ -7,7 +7,8 @@
 #
 # Os segredos vêm de backend/.env (não versionado) e nunca entram na imagem.
 # O backend não publica porta no host: várias réplicas não podem ocupar a
-# mesma porta. A entrada externa é o load balancer (Fase 8).
+# mesma porta. A entrada externa é o Nginx (Fase 8), em http://localhost:8080,
+# que reparte as requisições entre as réplicas.
 
 services:
   redis:
@@ -30,6 +31,9 @@ services:
       # Sobrescreve o REDIS_URL do .env (que aponta para localhost): dentro
       # da rede do Compose, o Redis é alcançado pelo nome do serviço.
       REDIS_URL: redis://redis:6379
+      # Fase 8 — o backend está atrás do Nginx: confiar no X-Forwarded-For
+      # para req.ip (rate limit e auditoria) refletir o cliente, não o proxy.
+      TRUST_PROXY: "true"
     depends_on:
       redis:
         condition: service_healthy
@@ -41,6 +45,23 @@ services:
       start_period: 15s
     deploy:
       replicas: 3
+
+  nginx:
+    image: nginx:1.27-alpine
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    ports:
+      - "8080:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      # 127.0.0.1 e não localhost: no container, localhost resolve para ::1 (IPv6)
+      # e o Nginx só escuta em IPv4.
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1/nginx-health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
 
 volumes:
   redis-data:

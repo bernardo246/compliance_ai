@@ -22,18 +22,19 @@ do plano:
   qualquer persistência. Testável isoladamente via `npm run golden:test`
   (ver seção 5).
 - **Fase 5** — Pipeline assíncrono: o upload enfileira a análise e responde na
-  hora; um worker in-process (sem Redis) baixa o arquivo do Storage, chama a
-  IA, grava em `analyses` e move `documents.status` `uploaded` → `processing`
-  → `done`/`error`. Endpoint `GET /api/analyses/:id`. Testável ponta a ponta
-  via `npm run pipeline:test` (ver seção 5.1).
+  hora; um worker baixa o arquivo do Storage, chama a IA, grava em `analyses`
+  e move `documents.status` `uploaded` → `processing` → `done`/`error`.
+  Endpoint `GET /api/analyses/:id`. Testável ponta a ponta via
+  `npm run pipeline:test` (ver seção 5.1). *Nasceu com uma fila em memória;
+  hoje roda sobre **BullMQ + Redis** (ver "Escalabilidade horizontal").*
 - **Fase 6** — Frontend de status e resultado: tela `/documentos/[id]` que faz
   polling do status (`uploaded`/`processing` → atualiza sozinha a cada 4s) e,
   quando `done`, renderiza o resultado completo (resumo executivo, checklist
   item a item com veredito/severidade/evidência/sugestão, dados faltantes,
   sugestões de melhoria, aviso legal). A lista em `/upload` também faz polling
   e cada item vira link para o resultado.
-- **Fase 7** — Retenção de 72h: job agendado (`@nestjs/schedule`, a cada hora)
-  varre `documents` com `expira_em` vencido, remove **só o arquivo original**
+- **Fase 7** — Retenção de 72h: job agendado (hoje um job repetível do
+  BullMQ, a cada hora; nasceu como `@Cron`) varre `documents` com `expira_em` vencido, remove **só o arquivo original**
   do Storage e marca `storage_path = null` + `deletado_em` — o resultado em
   `analyses` nunca é tocado. Exclusão antecipada pelo próprio usuário já existe
   desde a Fase 3 (`DELETE /api/documents/:id`). Testável via
@@ -53,6 +54,12 @@ do plano:
   nunca avaliação clínica. Golden set próprio por área (12 fixtures no total),
   testável via `npm run golden:test` (ver seção 5).
 
+- **Escalabilidade horizontal** (trabalho separado, em 8 etapas — ver a seção
+  "Escalabilidade horizontal — Redis, BullMQ e Nginx"): estado compartilhado
+  em Redis (rate limit, fila, agendamento), imagem Docker do backend,
+  Docker Compose com várias réplicas e Nginx na frente, com testes de race
+  condition, queda de réplica e dois dispositivos na mesma conta.
+
 O visual do frontend segue à risca o `design-system.md` (paleta escura +
 verde, glassmorphism, grid de fundo, glow, tipografia).
 
@@ -67,12 +74,19 @@ projeto-analise-ia/
 ├── backend/
 │   ├── src/
 │   │   ├── auth/          # Fase 1-2 (Fase 8: rate limit dedicado + logs de auditoria)
-│   │   ├── documents/     # Fase 3 (upload) + retention.service.ts (Fase 7)
+│   │   ├── common/redis/  # Escalabilidade — cliente Redis compartilhado + cache
+│   │   ├── common/debug/  # Escalabilidade — endpoint de diagnóstico (instância + contador + IP)
+│   │   ├── documents/     # Fase 3 (upload) + retention.service/processor (Fase 7, BullMQ)
 │   │   │   └── security/  # Fase 8 — malware-scan.service.ts, pdf-heuristics.ts, clamav.client.ts
-│   │   └── analysis/      # Fase 4-5 — extração, runner, schema; prompts/ tem as 6 áreas (Fase 4 + 9)
+│   │   └── analysis/      # Fase 4-5 — extração, analysis-queue.service + analysis.processor (BullMQ), schema; prompts/ tem as 6 áreas (Fase 4 + 9)
+│   ├── Dockerfile         # Escalabilidade — imagem multi-stage, usuário não-root, sem segredos
 │   ├── scripts/           # golden set (F4/F9) + pipeline (F5) + retenção (F7) + malware/segurança (F8)
+│   │                      # + testes de escalabilidade: queue-race, double-stall, e2e-http, load-balancer
 │   ├── test-fixtures/     # 12 PDFs de teste (2 por área) com problemas conhecidos injetados
 │   └── sql/               # 001_init + 002_analysis_pipeline + 003_retention.sql (rodar no Supabase, em ordem)
+├── nginx/nginx.conf        # Escalabilidade — load balancer na frente das réplicas
+├── docker-compose.yml      # Escalabilidade — Redis + N réplicas do backend + Nginx (porta 8080)
+├── docker-compose.test.yml # Override só p/ testes: expõe o Redis em localhost:6379
 └── frontend/               # Next.js 16 (App Router)
     └── src/
         ├── app/
@@ -87,6 +101,9 @@ projeto-analise-ia/
 - Node.js 22+ (testado com Node 24)
 - Uma conta/projeto no [Supabase](https://supabase.com) (Postgres + Storage)
 - Uma conta na [OpenRouter](https://openrouter.ai) (para a Fase 4 — análise via IA, usando a camada gratuita)
+- Docker (Docker Desktop) — só para o ambiente de várias réplicas com Redis e
+  Nginx (seção "Escalabilidade horizontal"); rodar o backend com
+  `npm run start:dev` também exige um Redis acessível em `REDIS_URL`
 - OpenSSL (para gerar o par de chaves RS256) — já vem instalado no macOS/Linux;
   no Windows, use o Git Bash ou o WSL
 
@@ -220,6 +237,12 @@ npm run start:dev
 # API em http://localhost:3001
 ```
 
+> **Precisa de um Redis.** O rate limit e a fila de análise usam Redis, então
+> o backend não sobe sem um acessível em `REDIS_URL` (o `.env.example` já traz
+> `redis://localhost:6379`). O jeito mais simples de ter um:
+> `docker run -d --name redis -p 6379:6379 redis:7-alpine`. Para o ambiente
+> completo (várias réplicas + Nginx), veja "Escalabilidade horizontal".
+
 Teste rápido:
 
 ```bash
@@ -281,7 +304,7 @@ npm run pipeline:test
 ```
 
 O script cria um documento de teste, sobe o PDF para o Storage, chama
-`AnalysisRunnerService.enqueue()` (o mesmo que o upload faz) e faz polling em
+`AnalysisQueueService.enqueue()` (o mesmo que o upload faz; precisa de um Redis em `REDIS_URL`) e faz polling em
 `documents.status`, imprimindo as transições:
 
 ```
@@ -296,24 +319,35 @@ Ao final imprime a linha de `analyses` gravada e **limpa tudo que criou**
 
 **Como funciona no backend:**
 
-- `DocumentsService.upload()` chama `analysisRunner.enqueue(id)` **sem `await`**
+- `DocumentsService.upload()` chama `analysisQueue.enqueue(id)` **sem `await`**
   — a resposta do upload volta na hora com `status: 'uploaded'`.
-- `AnalysisRunnerService` (`src/analysis/analysis-runner.service.ts`) tem uma
-  fila em memória com concorrência `ANALYSIS_CONCURRENCY` (default 2). Cada job:
-  baixa o arquivo do Storage → `AnalysisService.analyze()` → `upsert` em
-  `analyses` (idempotente, `unique(document_id)`) → `status = 'done'`. Qualquer
-  erro no caminho vira `status = 'error'` + `documents.erro` com a mensagem.
+- `AnalysisQueueService` (`src/analysis/analysis-queue.service.ts`) coloca o job
+  numa fila **BullMQ no Redis**, com `jobId = documentId` (um job por documento
+  por vez). `AnalysisProcessor` (`src/analysis/analysis.processor.ts`) é o
+  worker, com concorrência **fixa em 2 por réplica** (o decorator `@Processor`
+  é avaliado antes do `.env` carregar, então não dá para ler de config; a
+  variável `ANALYSIS_CONCURRENCY` ficou sem efeito). Cada job: baixa o arquivo
+  do Storage → `AnalysisService.analyze()` → `upsert` em `analyses`
+  (idempotente, `unique(document_id)`) → `status = 'done'`. Qualquer erro no
+  caminho vira `status = 'error'` + `documents.erro` com a mensagem.
 - No boot, `recoverPending()` reenfileira documentos que ficaram em `uploaded`
   (enqueue perdido num restart) ou `processing` há mais de
-  `ANALYSIS_STUCK_TIMEOUT_MS` (processo caiu no meio de uma análise).
+  `ANALYSIS_STUCK_TIMEOUT_MS` (processo caiu no meio de uma análise). O
+  `jobId` evita duplicar quando várias réplicas sobem juntas.
 - `GET /api/analyses/:id` devolve o resultado (checagem de dono via join com
   `documents.user_id`). `GET /api/documents/:id` passa a incluir `analise`
   (ou `null`) — o frontend consulta status + resultado numa chamada só.
 
 **Decisão de arquitetura — fila in-process vs. BullMQ + Redis**
 
+> **Histórico:** esta decisão foi revertida. A Fase 5 nasceu com a fila
+> in-process descrita abaixo; ao fazer a aplicação escalar horizontalmente, o
+> gatilho citado no fim desta seção foi atingido e a fila migrou para BullMQ
+> (Etapa 4 de "Escalabilidade horizontal"). A comparação continua válida como
+> registro do raciocínio.
+
 A spec permite as duas (*"BullMQ/Redis **ou** processamento em background
-simples"*). Optou-se pela fila in-process. Comparação:
+simples"*). Na época optou-se pela fila in-process. Comparação:
 
 | Aspecto | In-process (implementado) | BullMQ + Redis |
 |---|---|---|
@@ -357,8 +391,11 @@ npm run retention:test
 **Como funciona no backend:**
 
 - `RetentionService.purgeExpired()` (`src/documents/retention.service.ts`),
-  decorado com `@Cron(CronExpression.EVERY_HOUR)` — habilitado via
-  `ScheduleModule.forRoot()` em `app.module.ts`.
+  disparado a cada hora por um **job repetível do BullMQ**: no boot, cada
+  réplica chama `upsertJobScheduler('retencao-horaria', { pattern: '0 * * * *' })`
+  (idempotente — o Redis guarda um scheduler só) e o `RetentionProcessor`
+  executa a varredura em uma réplica por hora. Antes era `@Cron`
+  (`@nestjs/schedule`, removido).
 - A cada hora, varre `documents` com `deletado_em is null`, `storage_path`
   presente e `expira_em` vencido. Para cada um: remove o arquivo do Storage,
   depois `storage_path = null` + `deletado_em = now()`. **Nunca** apaga a
@@ -499,21 +536,23 @@ por requisição escala liso.
 
 | Fase | Escala horizontal hoje? | O que falta para escalar |
 |---|---|---|
-| 0 — Infra | ⚠️ Quase | Rate limiter (`@nestjs/throttler`) usa contadores em RAM → mover para Redis |
+| 0 — Infra | ✅ Sim (resolvido) | Era o rate limiter em RAM; agora os contadores ficam no Redis (Etapa 2) |
 | 1 — Auth | ✅ Sim | Nada (só as chaves RS256 idênticas em todas as instâncias) |
 | 2 — Autorização / Termo | ✅ Sim | Nada |
 | 3 — Upload | ✅ Sim | Nada (atenção operacional: Multer bufferiza em RAM) |
 | 4 — IA (função isolada) | ✅ Sim | Nada no código (cuidado com o rate limit externo da OpenRouter) |
-| 5 — Pipeline assíncrono | ❌ Não | Fila in-process → BullMQ + Redis |
+| 5 — Pipeline assíncrono | ✅ Sim (resolvido) | Era a fila in-process; agora é BullMQ + Redis (Etapa 4) |
 | 6 — Frontend de status/resultado | ✅ Sim | Nada (frontend é stateless; atenção é ao **volume de polling** que ele gera no backend) |
-| 7 — Retenção de 72h | ⚠️ Quase | `@Cron` roda por processo → com N instâncias, todas disparam a mesma varredura na mesma hora |
+| 7 — Retenção de 72h | ✅ Sim (resolvido) | Era o `@Cron` por processo; agora é um job repetível do BullMQ, uma execução por hora (Etapa 5) |
 | 8 — Hardening de segurança | ✅ Sim | Nada de novo — herda a ressalva do rate limiter da Fase 0 (mesmo Redis resolve). ClamAV, se ligado, é um serviço externo compartilhado como o Supabase (todas as instâncias apontam pro mesmo `clamd`), não estado por instância |
 | 9 — Expansão de templates | ✅ Sim | Nada — mesmo perfil da Fase 4 (templates são strings estáticas em código, zero estado, zero banco) |
 
-**Conclusão:** adicionar **um único Redis** resolve a Fase 0 (rate limit
-distribuído) e a Fase 5 (fila durável e compartilhada) de uma vez — e também
-dá uma saída pronta para a Fase 7 (repeatable job do BullMQ roda uma vez só,
-não por instância).
+**Conclusão:** adicionar **um único Redis** resolveu a Fase 0 (rate limit
+distribuído), a Fase 5 (fila durável e compartilhada) e a Fase 7 (repeatable
+job do BullMQ roda uma vez só, não por instância). Os detalhes, os testes e as
+limitações que sobraram estão na seção "Escalabilidade horizontal". *As
+tabelas por fase abaixo descrevem o estado de cada fase quando foi entregue e
+trazem uma nota "Atualização" onde o Redis mudou o quadro.*
 
 ---
 
@@ -538,6 +577,10 @@ ao `FRONTEND_URL`, `ValidationPipe` global (whitelist + forbidNonWhitelisted);
 
 **Para escalar:** trocar o storage do throttler por um compartilhado
 (`@nest-lab/throttler-storage-redis`). É o mesmo Redis que a Fase 5 vai querer.
+
+> **Atualização:** feito (Etapa 2 de "Escalabilidade horizontal"). Os contadores
+> do rate limit ficam no Redis; o limite vale somado entre todas as réplicas
+> (provado: 5 logins passam, o 6º dá `429`, mesmo alternando entre réplicas).
 
 ---
 
@@ -678,6 +721,13 @@ worker isolável do servidor HTTP. A migração é localizada (`enqueue()` vira
 controllers ou schema. Comparação completa e gatilho de migração na
 **seção 5.1**.
 
+> **Atualização:** feito (Etapa 4 de "Escalabilidade horizontal"). A fila é
+> BullMQ no Redis; qualquer réplica enfileira e qualquer worker processa.
+> Provado com 3 réplicas: cada documento é processado exatamente uma vez sob
+> enfileiramentos simultâneos, e a queda de uma réplica no meio de uma análise
+> não perde o documento. Os limites que ficaram estão na seção
+> "Limitações conhecidas".
+
 ---
 
 ### Fase 6 — Frontend de Upload e Resultado
@@ -747,6 +797,12 @@ execução daquela hora), rodar a varredura como `pg_cron` no próprio Supabase
 em vez de no processo do backend, ou — se o Redis da Fase 5 já existir —
 migrar para um *repeatable job* do BullMQ, que roda uma vez só independente de
 quantas instâncias do worker estejam de pé.
+
+> **Atualização:** feito (Etapa 5 de "Escalabilidade horizontal"), pela última
+> opção: o `@Cron` virou um job repetível do BullMQ e o `ScheduleModule` /
+> `@nestjs/schedule` foram removidos. Com 2 réplicas no mesmo Redis ficou um
+> único scheduler e um job disparado manualmente foi executado por uma réplica
+> só.
 
 ---
 
@@ -842,15 +898,249 @@ OpenRouter (Fase 4/8).
 
 ---
 
+## Escalabilidade horizontal — Redis, BullMQ e Nginx
+
+Trabalho separado das Fases 0–9 do produto, feito em **8 etapas** (aqui
+chamadas de *Etapas* para não confundir com as Fases). Objetivo: o backend ficar
+**stateless** — nenhum estado importante na memória do processo — para rodar N
+réplicas atrás de um load balancer, todas enxergando o mesmo rate limit, a
+mesma fila e o mesmo agendamento.
+
+```
+                     ┌────────────┐
+ cliente ──HTTP──►   │   Nginx    │  :8080   reparte as requisições (rodízio)
+                     └─────┬──────┘
+          ┌────────────────┼────────────────┐
+          ▼                ▼                ▼
+     backend-1        backend-2        backend-3      N réplicas idênticas,
+     (API + worker)   (API + worker)   (API + worker)  sem estado local
+          └────────────────┼────────────────┘
+                           ▼
+                        Redis  ──  rate limit · fila BullMQ · agendamento
+                           ▲
+     Supabase (Postgres + Storage) — dados e arquivos, também compartilhados
+```
+
+### Como subir o ambiente
+
+```bash
+# na raiz do repositório (precisa do backend/.env preenchido — seções 1 a 3)
+docker compose up -d --build        # Redis + 3 réplicas + Nginx em http://localhost:8080
+curl http://localhost:8080/api/health
+
+docker compose up -d --no-recreate --scale backend=5 backend   # muda o nº de réplicas
+docker compose down -v              # derruba tudo
+```
+
+- O Compose lê os segredos de `backend/.env` (nunca entram na imagem) e
+  **sobrescreve** `REDIS_URL` (`redis://redis:6379`, o nome do serviço) e
+  `TRUST_PROXY=true`. `backend/.env.example` e `frontend/.env.example` listam
+  todas as variáveis (segredos como placeholders): `cp .env.example .env`.
+- Para o frontend usar o load balancer, aponte `NEXT_PUBLIC_API_URL` para
+  `http://localhost:8080` (hoje é `http://localhost:3001`).
+- Rodando o backend fora do Docker (`npm run start:dev`), é preciso um Redis em
+  `REDIS_URL` (default `redis://localhost:6379`).
+
+| Variável | Para quê |
+|---|---|
+| `REDIS_URL` | Conexão com o Redis (rate limit, cache, BullMQ). Em produção, `rediss://` (TLS) com senha |
+| `TRUST_PROXY` | `true` só atrás de um proxy conhecido: faz `req.ip` vir do `X-Forwarded-For` |
+| `ANALYSIS_CONCURRENCY` | **Sem efeito hoje**: a concorrência do worker é fixa em 2 por réplica (o decorator é avaliado antes do `.env` carregar) |
+| `ANALYSIS_STUCK_TIMEOUT_MS` | Idade a partir da qual um documento em `processing` é reenfileirado no boot |
+
+### Etapa 1 — Cliente Redis compartilhado
+
+**O que faz:** uma conexão única com o Redis, injetável em qualquer módulo.
+**Implementado:** `src/common/redis/redis.module.ts` (`@Global`, token
+`REDIS_CLIENT` em `redis.constants.ts`), cliente `ioredis` com
+`maxRetriesPerRequest: null` (exigido pelo BullMQ) e `quit()` no shutdown; `redis.url`
+em `configuration.ts`. O BullMQ **não** reaproveita este cliente: workers usam
+comandos bloqueantes e abrem conexões próprias.
+
+### Etapa 2 — Rate limit no Redis
+
+**O que faz:** o limite de requisições passa a valer somado entre as réplicas.
+**Implementado:** `ThrottlerModule.forRootAsync` com
+`ThrottlerStorageRedisService` sobre o `REDIS_CLIENT` (`app.module.ts`). Os
+limites não mudaram (30/min geral, 5/min login e registro, 10/min upload).
+**Provado:** 35 logins inválidos seguidos → 5×`401`, depois `429`; reiniciando o
+backend, a primeira requisição já veio `429` (o contador não está na memória).
+
+### Etapa 3 — Cache/contador e endpoint de diagnóstico
+
+**O que faz:** prova, com um número visível, que o estado é compartilhado.
+**Implementado:** `RedisCacheService` (`get`, `set` com TTL, `increment` via
+`INCR`, atômico) e `GET /api/debug/instance`, que devolve `instanceId` (o
+`HOSTNAME` do container), `hits` (contador no Redis), `ip` (o `req.ip` do rate
+limit) e `timestamp`. É `@Public` e fora do rate limit de propósito (os testes
+mandam centenas de requisições por minuto). **Remover ou proteger antes de
+produção.** **Provado:** dois backends alternando 5 chamadas → `hits` 1, 2, 3, 4, 5.
+
+### Etapa 4 — Fila de análise no BullMQ
+
+**O que faz:** o job de análise vive no Redis; qualquer réplica enfileira e
+qualquer worker processa, uma réplica por job.
+**Implementado:**
+
+- `AnalysisQueueService` — produtor. `jobId = documentId`, com
+  `removeOnComplete`/`removeOnFail`; falha ao enfileirar não derruba o upload
+  (o documento fica `uploaded` e o `recoverPending()` do boot o reenfileira).
+- `AnalysisProcessor` — worker, mesma lógica do antigo runner. Remove-se o
+  `AnalysisRunnerService`.
+- **Rede de segurança** `@OnWorkerEvent('failed')`: se o job falha de vez (ex.:
+  travou duas vezes seguidas porque duas réplicas caíram no meio da análise), o
+  documento vai para `status = 'error'` com a mensagem *"A análise foi
+  interrompida por uma falha no servidor antes de terminar. Envie o documento
+  novamente."* — o frontend já exibe `documents.erro`. Só mexe em documentos
+  `uploaded`/`processing` (nunca sobrescreve um `done`) e tenta 3 vezes com
+  espera, porque essa gravação é a única coisa que tira o documento de
+  `processing`. Sem isso, o job sumia da fila e o documento ficava preso para
+  sempre (defeito real, encontrado nos testes abaixo).
+
+**Duplicatas — o que a fila garante e o que não garante.** O Redis só aceita um
+job novo se não existir outro com o mesmo `jobId`. Como o job é apagado ao
+terminar (`removeOnComplete`), o id fica livre; uma cópia que chega *depois* do
+original terminar vira um job novo. No teste de carga com jobs de ~10 ms,
+286 de 3.000 jobs rodaram duas vezes por isso (3.286 execuções; cada um dos 286
+rodou exatamente 2×). Com a fila pausada durante a rajada, deu 3.000 execuções
+exatas. No app real a análise leva de 30 a 100 s e as cópias de um enqueue chegam
+em milissegundos, então a janela não existe na prática; uma cópia tardia (ex.:
+`recoverPending()`) é barrada pela checagem do banco — o worker ignora documento
+já `done`. Essa checagem só cobre `done`: um documento em `error` reenfileirado
+tarde seria reanalisado (hoje nada reenfileira documentos em `error`).
+
+### Etapa 5 — Retenção de 72h como job repetível
+
+Ver Fase 7. `RetentionService` agenda a varredura com `upsertJobScheduler`
+(idempotente) e `RetentionProcessor` a executa; `@nestjs/schedule` foi removido.
+**Provado:** com 2 réplicas, um único scheduler no Redis e um job manual
+executado por uma réplica só; `npm run retention:test` continua passando.
+
+### Etapa 6 — Dockerfile do backend
+
+**Implementado:** `backend/Dockerfile` multi-stage (`node:22-alpine`: build com
+devDependencies → dependências só de produção → runtime enxuto), roda como o
+usuário `node`, 404 MB. `.dockerignore` deixa de fora `.env`, `*.pem`, `scripts`,
+`sql` e `test-fixtures`: **segredos nunca entram na imagem**, vêm por variável de
+ambiente. **Provado:** o `bcrypt` nativo carrega no Alpine; não há `.env` nem `.pem`
+dentro da imagem; sobe, conecta no Redis e responde `/api/health`.
+
+### Etapa 7 — Docker Compose com várias réplicas
+
+**Implementado:** `docker-compose.yml` — Redis (`redis:7-alpine`, AOF ligado, com
+volume, para a fila sobreviver a um restart) e `backend` com `replicas: 3`,
+healthchecks e `depends_on` com `service_healthy`. O backend não publica porta
+(várias réplicas não dividem uma porta do host). O `env_file` do Compose remove as
+aspas das chaves JWT do `.env`, o que `docker run --env-file` não faz.
+`docker-compose.test.yml` é um override só de testes que expõe o Redis em
+`localhost:6379`. **Provado:** as 3 réplicas conectam no mesmo Redis (nome do
+serviço, não `localhost`), o contador de `/api/debug/instance` sobe sem repetir
+entre elas e o limite de login vale somado.
+
+### Etapa 8 — Nginx na frente
+
+**O que faz:** única porta de entrada (`:8080`) e distribuição das requisições.
+**Implementado:** `nginx/nginx.conf` + serviço `nginx` no Compose.
+
+- O nome `backend` é resolvido pelo DNS do Docker (`127.0.0.11`, `valid=5s`) por
+  **variável** no `proxy_pass`, então réplicas criadas ou removidas com `--scale`
+  entram e saem da rotação sem reiniciar o Nginx.
+- `X-Forwarded-For` é **sobrescrito** com o IP de quem conectou (não acrescentado):
+  o cliente não consegue forjar o IP, e o backend (`TRUST_PROXY=true`) usa esse IP
+  no rate limit e na auditoria.
+- `client_max_body_size 25m` (uploads de até 20 MB; o padrão do Nginx, 1 MB,
+  devolveria `413` antes de chegar ao backend).
+- Tenta a próxima réplica se uma não responde ao conectar; não repete POST já enviado.
+- O healthcheck usa `127.0.0.1`: no container, `localhost` resolve para IPv6 e o
+  Nginx só escuta em IPv4.
+
+### Como foi testado
+
+| Script | O que exercita | Resultado |
+|---|---|---|
+| `backend/scripts/test-queue-race.ts` | 6 a 20 documentos reais, cada um enfileirado 15× ao mesmo tempo por 3 produtores independentes, 3 réplicas consumindo; replay de documentos `done`; com `--kill`, mata uma réplica no meio da análise | Cada documento processado exatamente 1×, 0 linhas duplicadas em `analyses`, 0 reanálises no replay; com a réplica morta, todos terminaram (20 docs / 300 enqueues: 18 `done`, 2 `error` por resposta da IA fora do schema) |
+| `backend/scripts/test-double-stall.ts` | Mata duas réplicas em sequência durante a análise do mesmo documento | Antes da correção: documento preso em `processing`. Depois: `error` com a mensagem ao usuário |
+| `backend/scripts/test-e2e-http.js` | Pela API HTTP: cadastro, termos, login, 8 uploads simultâneos, leitura do resultado — sempre alternando réplicas | Tudo passou; 8 documentos, cada um processado 1× |
+| `backend/scripts/test-load-balancer.js` | Nginx: distribuição, contador, IP real e header forjado, upload grande, **dois dispositivos na mesma conta**, rate limit global, réplica morta, escala para 5 réplicas | 15 de 15 verificações passaram (distribuição 56/49/45; 0 falhas em 60 requisições com uma réplica morta; 5 réplicas usadas sem reiniciar o Nginx) |
+| Carga na camada da fila (3.000 jobs, 30.000 enqueues, 3 workers em containers separados) | O comportamento do BullMQ sob volume | 3.000 execuções exatas com a fila pausada na rajada; 286 duplicados sem pausar (ver Etapa 4). **O script não ficou no repositório** |
+
+```bash
+# queue-race e double-stall rodam no host e precisam do Redis exposto:
+docker compose -f docker-compose.yml -f docker-compose.test.yml up -d --build
+cd backend
+TS_NODE_FILES=true npx ts-node scripts/test-queue-race.ts            # N_DOCS=20 para o teste maior
+TS_NODE_FILES=true npx ts-node scripts/test-queue-race.ts --kill     # derruba uma réplica no meio
+TS_NODE_FILES=true npx ts-node scripts/test-double-stall.ts          # mata 2 réplicas (religa no fim)
+cd ..
+node backend/scripts/test-load-balancer.js                           # precisa do Nginx em :8080; leva alguns minutos
+# e2e pela API, dentro da rede do Compose:
+docker compose run --rm --no-deps -T -e NODE_PATH=/app/node_modules \
+  -v "$PWD/backend/scripts:/t:ro" -v "$PWD/backend/test-fixtures:/fx:ro" \
+  backend node /t/test-e2e-http.js
+```
+
+Todos usam o Supabase e o OpenRouter reais, criam um usuário de teste e **apagam
+os dados que criaram**. Se um deles for interrompido no meio, a limpeza pode não
+rodar: confira o Supabase por usuários `race-test+`, `stall-test+`, `e2e-http+`
+ou `lb-test+`.
+
+### Limitações conhecidas
+
+- **Documento preso se o banco estiver fora quando a análise falha.** Se a
+  análise falha e a gravação de `status = 'error'` também falha (queda de rede),
+  o `setStatus` só registra em log e o job termina "com sucesso": o documento
+  fica em `processing` e nada o recupera, porque o job não falhou e a rede de
+  segurança da Etapa 4 não dispara. Visto uma vez, durante uma queda de rede
+  (5 de 6 documentos). **Não corrigido.**
+- `recoverPending()` roda só no boot e só pega documentos parados há mais de
+  `ANALYSIS_STUCK_TIMEOUT_MS` (10 min por padrão); não há varredura periódica.
+- Concorrência do worker fixa em 2 por réplica.
+- O volume de milhares de jobs foi testado só na camada da fila; o processador
+  real com Supabase foi testado até 20 documentos (o OpenRouter gratuito não
+  aguenta mais que isso). Queda de réplica testada com 1 e com 2 mortes
+  seguidas, uma vez cada.
+- Redis do Compose é **uma instância**, sem senha e sem réplica: serve para
+  simular, não para produção.
+- Pelo Docker Desktop (Mac), todo acesso do host aparece como `192.168.65.1`, então
+  clientes locais dividem o mesmo limite de IP. Atrás de um load balancer de
+  provedor o IP deve ser o real, mas isso só se confirma com deploy.
+- `/api/debug/instance` é público e fora do rate limit.
+- Cerca de 1 em cada 10 análises do modelo gratuito termina em `error` por
+  resposta fora do schema (falha da IA, não da fila).
+
+### Migrar para produção — plano (NÃO implementado)
+
+O que o Supabase já é para o banco, o Redis precisa ser para a fila: um serviço
+gerenciado, não um container.
+
+1. **Redis gerenciado** (Upstash, Redis Cloud, ElastiCache, ou o Redis do próprio
+   provedor de deploy): trocar só o `REDIS_URL`. Pontos a conferir: TLS (`rediss://`)
+   e senha na URL; persistência (AOF) ligada; `maxmemory-policy = noeviction` (o
+   BullMQ exige, senão pode perder jobs por eviction); mesma região do backend; e o
+   limite de conexões do plano — cada réplica abre várias (cliente compartilhado
+   mais as conexões do BullMQ por fila e worker).
+2. **Réplicas reais:** publicar a imagem em um registry, configurar as variáveis
+   (idealmente num secrets manager), mínimo de 2 instâncias, healthcheck em
+   `/api/health`.
+3. **Load balancer do provedor** no lugar do Nginx local (que é só simulação).
+   `TRUST_PROXY=true` apenas com proxy de fato na frente, e o número de saltos
+   (`trust proxy 1`) tem de bater com a topologia (CDN + LB contam como mais de um).
+4. **`NODE_ENV=production` exige HTTPS:** o cookie do refresh token passa a ser
+   `secure`. Localmente o container usa `NODE_ENV=development` (vem do `.env`).
+5. **Antes de ir:** remover ou proteger `/api/debug/instance`, tratar as limitações
+   acima (principalmente a do documento preso) e alertar sobre jobs falhos e
+   documentos parados em `processing`.
+
+---
+
 ## Infraestrutura externa — o que este repo não inclui
 
 Duas categorias bem diferentes: o que é **obrigatório pra qualquer coisa
-funcionar** (já coberto nas seções 1 e 3 deste README) e o que é **opcional**
-— código já escrito e referenciado (env vars, clients, comentários nas
-tabelas de "como escalar" acima), mas sem o serviço de verdade rodando em
-lugar nenhum. Nenhum destes opcionais impede a aplicação de funcionar hoje;
-cada um resolve um problema específico que só aparece em cenários específicos
-(produção com antivírus de verdade, múltiplas instâncias, etc.).
+funcionar** (Supabase e OpenRouter, seções 1 e 3, mais o Redis, que o backend
+passou a exigir) e o que é **opcional** — código já escrito e referenciado
+(env vars, clients), mas sem o serviço de verdade rodando em lugar nenhum
+(ClamAV, `pg_cron`). Nenhum destes opcionais impede a aplicação de funcionar
+hoje.
 
 ### Obrigatórios pra rodar
 
@@ -858,15 +1148,16 @@ cada um resolve um problema específico que só aparece em cenários específico
 |---|---|---|
 | **Supabase** (Postgres + Storage) | Banco de dados de toda a aplicação e armazenamento dos arquivos enviados | Seção 1 deste README |
 | **OpenRouter** | Proxy de acesso ao modelo de IA que faz a análise de compliance (Fase 4) | Seção 3 deste README |
+| **Redis** | Rate limit compartilhado (Fase 0), fila de análise do BullMQ (Fase 5) e job repetível da retenção de 72h (Fase 7). **Sem ele o backend não sobe** | `REDIS_URL` no `.env`. Local: sobe no `docker-compose.yml` (ou `docker run -p 6379:6379 redis:7-alpine` com o backend fora do Docker). Produção: Redis gerenciado — ver "Migrar para produção" na seção "Escalabilidade horizontal" |
 
-### Opcionais — referenciados no código, não inclusos
+### Opcionais e de infraestrutura
 
 | Serviço | Pra que serve aqui | Onde está referenciado | Como ligar | Sem ele |
 |---|---|---|---|---|
 | **ClamAV** (`clamd`) | Scanner de vírus/malware por assinatura no upload de documentos (Fase 8) | `MalwareScanService` + `clamav.client.ts` (`src/documents/security/`), atrás de `ANTIVIRUS_ENABLED` | `docker run -p 3310:3310 clamav/clamav`, depois `ANTIVIRUS_ENABLED=true` + `CLAMAV_HOST`/`CLAMAV_PORT` no `.env` — é um switch, o código já fala o protocolo `INSTREAM` de verdade | Só a heurística estática de PDF roda (cobre os vetores mais comuns de PDF malicioso, mas não é um scanner de assinaturas) |
-| **Redis** | Três usos distintos, todos hoje resolvidos sem ele: (1) storage compartilhado do rate limiter, pra N instâncias do backend dividirem o mesmo contador (Fase 0); (2) fila do BullMQ, no lugar do `AnalysisRunnerService` in-process (Fase 5); (3) *repeatable job* do BullMQ pra rodar a retenção de 72h uma vez só entre N instâncias (Fase 7) | Citado nas tabelas "como escalar" das Fases 0, 5 e 7 — **nenhuma linha de código depende dele hoje**, é só a direção de evolução já documentada | Não é um switch — cada um dos 3 usos é uma migração de código (trocar o storage do throttler; reescrever o runner pra `queue.add()`/`new Worker()`; trocar `@Cron` por um repeatable job) | Tudo funciona normalmente numa instância única — só vira necessário ao escalar horizontalmente |
-| **Reverse proxy / load balancer** (Nginx, o proxy do provedor de deploy, etc.) | Terminar HTTPS e distribuir requisições entre instâncias em produção; é o pré-requisito pra `TRUST_PROXY=true` fazer sentido | `TRUST_PROXY` em `configuration.ts`/`main.ts` | Depende do provedor de hospedagem — só ligue `TRUST_PROXY=true` depois de confirmar que existe um proxy de fato na frente | `req.ip` usa o IP direto da conexão TCP — correto tanto em dev local quanto em deploy sem proxy na frente |
-| **`pg_cron`** (extensão nativa do Supabase) | Alternativa ao Redis pra resolver a duplicação de execução do cron da Fase 7 (N instâncias rodando a mesma varredura) **sem precisar de infraestrutura nova** — roda dentro do próprio Postgres do Supabase | Mencionado como opção na seção "Para escalar" da Fase 7 | Habilitar a extensão no painel do Supabase e mover a lógica de `RetentionService.purgeExpired()` pra uma function SQL agendada | O `@Cron` in-process do NestJS cobre uma instância única sem problema |
+| **Reverse proxy / load balancer** | Distribuir requisições entre as réplicas e terminar HTTPS; pré-requisito pra `TRUST_PROXY=true` fazer sentido | Local: `nginx/nginx.conf` + serviço `nginx` do Compose (simulação, porta 8080). `TRUST_PROXY` em `configuration.ts`/`main.ts` | Local: `docker compose up -d --build`. Produção: o load balancer do provedor de deploy no lugar do Nginx local; só ligue `TRUST_PROXY=true` depois de confirmar que existe um proxy de fato na frente | Sem proxy, `req.ip` usa o IP direto da conexão TCP — correto em dev local e em deploy sem proxy na frente |
+| **Docker / Docker Compose** | Rodar Redis, as réplicas do backend e o Nginx juntos na máquina | `backend/Dockerfile`, `docker-compose.yml`, `docker-compose.test.yml` | Instalar o Docker Desktop; `docker compose up -d --build` | O backend roda com `npm run start:dev`, mas precisa de um Redis em `REDIS_URL` e só tem 1 instância |
+| **`pg_cron`** (extensão nativa do Supabase) | Alternativa ao Redis pra agendar a retenção da Fase 7 **sem infraestrutura nova** — roda dentro do próprio Postgres do Supabase | Mencionado como opção na seção "Para escalar" da Fase 7 (a opção adotada foi o job repetível do BullMQ) | Habilitar a extensão no painel do Supabase e mover a lógica de `RetentionService.purgeExpired()` pra uma function SQL agendada | Não é necessária: a retenção já roda como job repetível do BullMQ |
 
 > Em produção, vale também considerar um **secrets manager** do provedor de
 > hospedagem (Vercel/Railway/Fly.io todos têm um) no lugar do `.env` em texto
@@ -877,6 +1168,13 @@ cada um resolve um problema específico que só aparece em cenários específico
 ---
 
 ## O que fica para as próximas fases
+
+- **Migração da escalabilidade para produção** (planejada, não implementada):
+  Redis gerenciado, réplicas reais atrás do load balancer do provedor, e o
+  tratamento das limitações listadas em "Escalabilidade horizontal" —
+  principalmente o documento que pode ficar preso em `processing` se o banco
+  estiver fora no momento em que a análise falha. O passo a passo está em
+  "Migrar para produção — plano".
 
 - **Fase 10** — Polimento e Deploy: deploy do backend (Railway/Render/Fly.io)
   e do frontend (Vercel), monitoramento básico (logs de erro, alertas de
@@ -917,3 +1215,11 @@ cada um resolve um problema específico que só aparece em cenários específico
   Fase 7) ou antes disso por pedido do usuário — minimização de dados (LGPD,
   art. 6º, III); o resultado da análise em `analyses` não depende do arquivo
   original e não é afetado pela exclusão.
+- Imagem Docker do backend sem segredos (`.env` e `*.pem` ficam no
+  `.dockerignore`; tudo vem por variável de ambiente em runtime) e rodando como
+  usuário sem privilégios (`node`).
+- Atrás do Nginx, o `X-Forwarded-For` é **sobrescrito** com o IP de quem
+  conectou, não acrescentado — o cliente não consegue forjar o IP usado pelo
+  rate limit e pelos logs de auditoria (provado no teste do load balancer).
+- Rate limit compartilhado no Redis: o limite vale somado entre todas as
+  réplicas, então distribuir requisições entre instâncias não o contorna.
