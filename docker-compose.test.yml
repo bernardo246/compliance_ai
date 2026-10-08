@@ -9,12 +9,9 @@
 #
 #   docker compose -f docker-compose.yml -f docker-compose.test.yml up -d --build
 #
-# Não use em produção: expõe o Redis (sem senha) na máquina.
+# Não use em produção. (A porta 6379 do Redis já é aberta, só em 127.0.0.1, pelo docker-compose.yml.)
 
 services:
-  redis:
-    ports:
-      - "6379:6379"
   backend:
     environment:
       ANALYSIS_RECOVERY_INTERVAL_MS: "30000"

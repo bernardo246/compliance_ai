@@ -17,6 +17,10 @@ services:
     command: ["redis-server", "--appendonly", "yes"]
     volumes:
       - redis-data:/data
+    # Só na própria máquina (127.0.0.1): permite rodar o backend FORA do Docker
+    # (npm run start:dev, REDIS_URL=redis://localhost:6379) usando este Redis.
+    ports:
+      - "127.0.0.1:6379:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s

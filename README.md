@@ -245,9 +245,15 @@ npm run start:dev
 
 > **Precisa de um Redis.** O rate limit e a fila de análise usam Redis, então
 > o backend não sobe sem um acessível em `REDIS_URL` (o `.env.example` já traz
-> `redis://localhost:6379`). O jeito mais simples de ter um:
-> `docker run -d --name redis -p 6379:6379 redis:7-alpine`. Para o ambiente
-> completo (várias réplicas + Nginx), veja "Escalabilidade horizontal".
+> `redis://localhost:6379`). O jeito mais simples de ter um, com o Docker aberto:
+>
+> ```bash
+> docker compose up -d redis      # na raiz do repositório; abre a porta 6379 só em 127.0.0.1
+> ```
+>
+> Sem isso o terminal enche de `ECONNREFUSED 127.0.0.1:6379`. Para o ambiente
+> completo (várias réplicas + Nginx), veja "Escalabilidade horizontal" e
+> "Qual Compose usar".
 
 Teste rápido:
 
@@ -927,6 +933,31 @@ mesma fila e o mesmo agendamento.
      Supabase (Postgres + Storage) — dados e arquivos, também compartilhados
 ```
 
+### Qual Compose usar
+
+| Arquivo | Para quê | O que sobe |
+|---|---|---|
+| `docker-compose.yml` | **Desenvolvimento local** | Redis (porta 6379 aberta só em `127.0.0.1`) + 3 réplicas do backend + Nginx em `http://localhost:8080` |
+| `docker-compose.test.yml` | **Só os scripts de teste** (complemento do anterior) | Alertas e varredura em intervalos curtos, webhook local em `:9099`. Nunca em produção |
+| `docker-compose.prod.yml` | **Deploy** | Nginx com HTTPS (80/443) + backend (`BACKEND_REPLICAS`, padrão 2). **Sem Redis**: o `REDIS_URL` vem do `backend/.env.production` e aponta para o Redis gerenciado (`rediss://...`) |
+
+Dois modos de rodar localmente:
+
+```bash
+# A) Backend fora do Docker (o dia a dia): só o Redis no Docker
+docker compose up -d redis          # Redis em localhost:6379
+cd backend && npm run start:dev     # API em http://localhost:3001
+
+# B) Tudo no Docker (várias réplicas atrás do Nginx)
+docker compose up -d --build        # API em http://localhost:8080
+```
+
+Em produção não existe `localhost` de aplicação: `REDIS_URL` com `localhost` faz o backend se
+recusar a subir (validação de boot). Os únicos `localhost`/`127.0.0.1` do `docker-compose.prod.yml`
+são os healthchecks, que rodam dentro do próprio container. Passo a passo do deploy em
+"Migrar para produção". Se você der `docker compose down`, suba o Redis de novo (modo A) antes do
+backend.
+
 ### Como subir o ambiente
 
 ```bash
@@ -945,7 +976,7 @@ docker compose down -v              # derruba tudo
 - Para o frontend usar o load balancer, aponte `NEXT_PUBLIC_API_URL` para
   `http://localhost:8080` (hoje é `http://localhost:3001`).
 - Rodando o backend fora do Docker (`npm run start:dev`), é preciso um Redis em
-  `REDIS_URL` (default `redis://localhost:6379`).
+  `REDIS_URL` (default `redis://localhost:6379`): `docker compose up -d redis` (ver "Qual Compose usar").
 
 | Variável | Para quê |
 |---|---|
@@ -1458,19 +1489,6 @@ hoje.
 
 ---
 
-## O que fica para as próximas fases
-
-- **Migração da escalabilidade para produção** (planejada, não implementada):
-  Redis gerenciado, réplicas reais atrás do load balancer do provedor, e o
-  tratamento das limitações listadas em "Escalabilidade horizontal" —
-  que sobraram. O passo a passo está em "Migrar para produção — plano".
-
-- **Fase 10** — Polimento e Deploy: deploy do backend (Railway/Render/Fly.io)
-  e do frontend (Vercel), monitoramento básico (logs de erro, alertas de
-  falha na API da IA), revisão final do Termo de Uso/Política de Privacidade
-  com texto jurídico real, e testes de carga leve no fluxo de upload +
-  análise. Última fase da spec — depois dela a aplicação está pronta pra uso
-  real com dados de usuários reais.
 
 ## Notas de segurança já aplicadas
 
