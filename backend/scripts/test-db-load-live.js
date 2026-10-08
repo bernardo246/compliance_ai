@@ -49,7 +49,7 @@ async function main() {
     // ---- 1. cache dos termos ---------------------------------------------------
     const aceito = await http('POST', '/api/auth/register', { json: { email: `dbload-ok+${stamp}@example.com`, password: 'Senha-Teste-123!' } });
     userIds.push(aceito.data.user.id);
-    await http('POST', '/api/auth/accept-terms', { token: aceito.data.accessToken, json: { version: process.env.TERMS_CURRENT_VERSION || '1.0.0' } });
+    await http('POST', '/api/auth/accept-terms', { token: aceito.data.accessToken, json: { version: process.env.TERMS_CURRENT_VERSION || '1.1.0' } });
 
     const antes = await redis.keys(`terms:ok:${aceito.data.user.id}:*`);
     const codigos = [];

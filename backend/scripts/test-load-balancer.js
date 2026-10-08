@@ -102,7 +102,7 @@ async function main() {
     userId = reg.data && reg.data.user && reg.data.user.id;
     const terms = await http('POST', '/api/auth/accept-terms', {
       token: reg.data.accessToken,
-      json: { version: process.env.TERMS_CURRENT_VERSION || '1.0.0' },
+      json: { version: process.env.TERMS_CURRENT_VERSION || '1.1.0' },
     });
     const loginB = await http('POST', '/api/auth/login', { json: { email, password } });
     const tokenA = reg.data.accessToken;

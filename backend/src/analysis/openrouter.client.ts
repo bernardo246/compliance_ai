@@ -41,6 +41,7 @@ export class OpenRouterClient {
 
     const model = this.config.get<string>('openrouter.model')!;
     const maxTokens = this.config.get<number>('openrouter.maxTokens')!;
+    const dataCollection = this.config.get<string>('openrouter.dataCollection') === 'allow' ? 'allow' : 'deny';
     const timeoutMs = this.config.get<number>('openrouter.timeoutMs')!;
     const maxRetries = this.config.get<number>('openrouter.maxRetries')!;
     const siteUrl = this.config.get<string>('openrouter.siteUrl');
@@ -62,6 +63,8 @@ export class OpenRouterClient {
         { role: 'user', content: userContent },
       ],
       max_tokens: maxTokens,
+      // Só provedores que não retêm nem treinam com o conteúdo (ver OPENROUTER_DATA_COLLECTION).
+      provider: { data_collection: dataCollection },
       temperature: 0, // determinístico — queremos consistência numa análise de compliance
       // Nem todo modelo/provedor por trás da OpenRouter respeita este campo;
       // por isso o prompt também instrui explicitamente "responda só JSON",

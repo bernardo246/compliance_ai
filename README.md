@@ -558,6 +558,7 @@ por requisição escala liso.
 | 7 — Retenção de 72h | ✅ Sim (resolvido) | Era o `@Cron` por processo; agora é um job repetível do BullMQ, uma execução por hora (Etapa 5) |
 | 8 — Hardening de segurança | ✅ Sim | Nada de novo — herda a ressalva do rate limiter da Fase 0 (mesmo Redis resolve). ClamAV, se ligado, é um serviço externo compartilhado como o Supabase (todas as instâncias apontam pro mesmo `clamd`), não estado por instância |
 | 9 — Expansão de templates | ✅ Sim | Nada — mesmo perfil da Fase 4 (templates são strings estáticas em código, zero estado, zero banco) |
+| 10 — Polimento e deploy | ✅ Sim | Nada de estado novo (texto dos termos é estático no frontend; a mudança de privacidade da IA é só um parâmetro da chamada). O deploy em si depende de provedores — ver a seção da Fase 10 |
 
 **Conclusão:** adicionar **um único Redis** resolveu a Fase 0 (rate limit
 distribuído), a Fase 5 (fila durável e compartilhada) e a Fase 7 (repeatable
@@ -908,6 +909,92 @@ precisam ser rodadas para validação completa (`npm run golden:test`).
 que já era coberto pelo `ANALYSIS_CONCURRENCY` (Fase 5) e pelo rate limit da
 OpenRouter (Fase 4/8).
 
+
+### Fase 10 — Polimento e Deploy
+
+A Fase 10 da especificação tem quatro itens. O que dá para fazer **no repositório** foi feito e testado;
+o que depende de conta em provedor, de domínio ou de advogado **não foi feito** (ver "Pendente").
+
+| Item da spec | Estado | O quê |
+|---|---|---|
+| Monitoramento básico | ✅ Feito (Fases anteriores) | Alertas por webhook, `/api/health/ready`, monitor externo (`uptime-check.js` + workflow do GitHub Actions). Seção "Monitoramento e alertas" |
+| Testes de carga leve (upload + análise) | ✅ Feito | `test-load-light.js`, resultados abaixo |
+| Termo de Uso / Privacidade com texto real | ⚠️ Texto reescrito e fiel ao sistema; **falta revisão de advogado** e os dados do responsável | Abaixo |
+| Deploy público com HTTPS | ❌ Não feito (precisa de provedor, domínio e certificado) | Arquivos prontos; passo a passo em "Migrar para produção" |
+
+**Achados ao revisar o termo contra o código (corrigidos ou levados a decisão):**
+
+1. **O texto prometia "não enviamos seus documentos para treinamento" e citava a "Claude API", mas o sistema usa a OpenRouter.**
+   Testado com a chave real: pedindo `provider.data_collection = "deny"` (só provedores que não guardam nem treinam com o
+   conteúdo), o modelo grátis **para de funcionar** (`404 No endpoints found matching your data policy (Free model training)`).
+   Ou seja: com modelo `:free`, o conteúdo dos documentos pode ser usado para treino pelo provedor. **Decisão do dono do
+   projeto: poder usar modelo gratuito em produção.** Então isso é uma escolha explícita e o texto acompanha:
+   - `OPENROUTER_DATA_COLLECTION=allow` + modelo `:free`: funciona em produção (o boot só **avisa** no log). O backend informa
+     o estado em `GET /api/privacy-info` (`{"ia_treino_permitido": true}`) e o Termo de Uso mostra, em destaque, que os
+     provedores gratuitos **podem guardar e usar o texto para treino**. Se a consulta falhar, o termo assume esse pior caso.
+   - `OPENROUTER_DATA_COLLECTION=deny` (padrão do código) + modelo **pago**: o termo diz que só usamos provedores que não
+     guardam nem treinam. `deny` com modelo `:free` sobe, mas as análises falham com 404 (o boot avisa).
+   - Como o texto é decidido pelo backend (e não por uma variável do frontend), os dois não ficam fora de sincronia. Se você
+     trocar de `allow` para `deny` (ou o contrário) com usuários já cadastrados, **aumente a versão do termo** para todos
+     aceitarem de novo.
+   - O seu `backend/.env` local usa `allow`. O `.env.production.example` traz `allow` + modelo `:free`, com a opção B (pago + `deny`) comentada.
+2. **O "excluir documento" apaga só o arquivo original** (`storage_path` e `deletado_em`); o resultado da análise
+   (incluindo a resposta bruta da IA, `raw_response`) continua no banco. O texto novo diz isso com todas as letras
+   (seção 5), mas é uma **decisão sua**: se a exclusão deve apagar também a análise (o que um pedido de eliminação
+   da LGPD sugere), é uma mudança de comportamento que não fiz sem você decidir.
+3. **Não existe exclusão de conta** nem exportação dos dados pelo próprio usuário: os direitos da LGPD ficam por
+   pedido ao e-mail de contato.
+4. O termo só aparecia **depois** do cadastro. Agora há a página pública `/privacidade` e o link na tela de cadastro.
+
+**Mudanças:**
+
+- `frontend/src/components/TermsContent.tsx`: texto novo (responsável, o que a plataforma faz e que a IA pode errar, dados
+  tratados, operadores — OpenRouter/provedor de IA e Supabase —, retenção, direitos LGPD, segurança, responsabilidades,
+  mudanças). Usado em `/termos` (aceite) e `/privacidade` (pública).
+- **Versão do termo 1.0.0 → 1.1.0** (`TERMS_CURRENT_VERSION` e `NEXT_PUBLIC_TERMS_VERSION`, que precisam ser iguais). Como
+  o texto mudou de verdade, **todo usuário existente precisará aceitar de novo** (é como o guard de termos funciona).
+  Os scripts de teste que gravam usuários direto no banco passaram a usar a versão vigente.
+- Variáveis `NEXT_PUBLIC_CONTROLLER_NAME` e `NEXT_PUBLIC_PRIVACY_EMAIL` (frontend, lidas no **build**): enquanto vazias, o
+  texto mostra um aviso amarelo no lugar dos dados do responsável. **Preencha antes de publicar.**
+- `OPENROUTER_DATA_COLLECTION` (backend) e `GET /api/privacy-info` (público), com avisos no boot de produção (`production-checks.ts`: 18 → 23 verificações testadas). O termo lê esse endpoint.
+- O build de produção do frontend (`npm run build`) passa, as páginas estáticas incluem `/privacidade`.
+
+**Teste de carga leve** (`backend/scripts/test-load-light.js`): 8 usuários simulados (cada um com IP próprio, para os limites
+por IP valerem de verdade) × 2 documentos = 16 análises reais, chegando em 15 s, falando direto com as 3 réplicas,
+Supabase e OpenRouter reais, 201 s no total:
+
+| Métrica | Resultado |
+|---|---|
+| Cadastro / aceite / upload | 8×201 / 8×200 / 16×201 (nenhum 429, nenhum 5xx, nenhuma falha de rede) |
+| Resposta do upload (POST) | p50 954 ms · p95 1690 ms |
+| Leitura de um documento (GET, 189 consultas, polling como o do frontend) | p50 451 ms · p95 680 ms |
+| Lista de documentos | p50 229 ms · p95 417 ms |
+| `/api/health/ready` sob carga (60 amostras) | 200 em todas, p95 479 ms |
+| Do upload ao resultado final | p50 106 s · p95 182 s |
+| Resultado | 15 `done`, 1 `error` (a IA devolveu um checklist fora do schema, o ~1 em 10 já conhecido), 0 presos |
+
+Como ler: **não é um teste de capacidade.** O gargalo do fluxo é a IA, não a API: são 6 análises simultâneas (2 por réplica) e
+cada uma leva dezenas de segundos, então 16 documentos levam ~3 min até o último resultado. A API em si (upload, leitura,
+lista, prontidão) respondeu em menos de 1,7 s no pior caso. As latências incluem a ida e volta até o Supabase na nuvem. Não
+testei mais usuários que isso, nem arquivos grandes (os de teste têm ~2 KB), nem com modelo pago.
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.test.yml up -d --build
+docker compose run --rm --no-deps -T -e NODE_PATH=/app/node_modules -e USERS=8 -e DOCS_PER_USER=2 \
+  -v "$PWD/backend/scripts:/t:ro" -v "$PWD/backend/test-fixtures:/fx:ro" backend node /t/test-load-light.js
+```
+
+**Pendente (depende de você, de provedores ou de advogado):**
+
+- Revisão **jurídica** do texto do termo (o texto é fiel ao código, mas não é parecer) e preencher
+  `NEXT_PUBLIC_CONTROLLER_NAME` / `NEXT_PUBLIC_PRIVACY_EMAIL`.
+- Decidir a exclusão da análise junto com o documento e se haverá exclusão de conta (achados 2 e 3).
+- Confirmar com o advogado o aviso de que o provedor gratuito pode treinar com o conteúdo (o termo já mostra isso enquanto `allow`), ou trocar para modelo **pago** + `deny` quando quiser. Com o modelo gratuito, o limite diário da OpenRouter faz as análises terminarem em erro até o dia seguinte.
+- Deploy: Redis gerenciado, VM, domínio, certificado HTTPS, frontend e API **sob o mesmo domínio raiz** (cookie
+  `SameSite=strict`), `HEALTH_URL` e webhook no GitHub, plano pago do Supabase, par de chaves JWT novo.
+  O critério de pronto da spec ("acessível publicamente, com HTTPS, funcionando de ponta a ponta para um usuário
+  externo") **só pode ser verificado depois disso**.
+
 ---
 
 ## Escalabilidade horizontal — Redis, BullMQ e Nginx
@@ -984,6 +1071,8 @@ docker compose down -v              # derruba tudo
 | `TRUST_PROXY` | `true` só atrás de um proxy conhecido: faz `req.ip` vir do `X-Forwarded-For` |
 | `ENABLE_DEBUG_ENDPOINT` | `true` liga o `/api/debug/instance` (público, fora do rate limit). **Desligado por padrão** (responde 404); só o `docker-compose.yml` local o liga, para os testes. Nunca em produção |
 | `ALERT_WEBHOOK_URL`, `ALERT_WEBHOOK_FORMAT`, `ALERT_CHECK_INTERVAL_MS`, `ALERT_COOLDOWN_MS` | Alertas de monitoramento (ver "Monitoramento e alertas") |
+| `OPENROUTER_DATA_COLLECTION` | `deny` (padrão): a OpenRouter só usa provedores que não guardam nem treinam com o conteúdo. `allow`: necessário para modelos `:free`; o provedor pode treinar com o conteúdo e o Termo de Uso avisa isso sozinho (`GET /api/privacy-info`). Em produção `allow` sobe com aviso |
+| `NEXT_PUBLIC_CONTROLLER_NAME`, `NEXT_PUBLIC_PRIVACY_EMAIL` | (frontend, lidas no build) Responsável pelos dados e contato de privacidade exibidos no Termo de Uso |
 | `REFRESH_REVOKED_RETENTION_MS` | Quanto tempo um refresh token já usado fica no banco antes de o job de retenção apagá-lo (padrão 3600000 = 1 h, mínimo 1 min) |
 | `ANALYSIS_CONCURRENCY` | **Sem efeito hoje**: a concorrência do worker é fixa em 2 por réplica (o decorator é avaliado antes do `.env` carregar) |
 | `ANALYSIS_STUCK_TIMEOUT_MS` | Idade a partir da qual um documento em `processing` é reenfileirado (no boot e na varredura periódica) |
@@ -1252,7 +1341,7 @@ entre elas e o limite de login vale somado.
 | **Frontend no navegador atrás do Nginx** (manual: `NEXT_PUBLIC_API_URL=http://localhost:8080 npm run dev` em `frontend/`, com o Compose local no ar) | Fluxo real de usuário: cadastro, aceite de termos, recarregar a página (a sessão volta pelo cookie `httpOnly` via `/api/auth/refresh`), upload de um PDF, polling do status na lista, tela de erro, tela de resultado, sair e entrar de novo | Tudo funcionou: todas as chamadas passaram por `localhost:8080` com CORS (preflight `204`), sem erro de CORS no console; o upload foi processado por uma réplica, a lista atualizou sozinha de "Processando" para "Concluído" e o resultado mostrou resumo, selo de conformidade e checklist de 23 itens. Um documento terminou em "Erro" por resposta da IA fora do schema (a falha conhecida do modelo gratuito), e a tela mostrou a mensagem com o convite a reenviar |
 | `backend/scripts/test-status-retry.ts` (`npm run status-retry:test`) | **Offline** (sem Redis/Supabase/IA): simula o banco falhando ao gravar o status e confere as tentativas, a seleção da varredura, o handler de `failed` a reivindicação condicional (não sobrescreve `done`, não pega excluído, a janela entre a leitura e a gravação), `error` como estado final e o worker zumbi | 20 de 20 verificações passaram |
 | `backend/scripts/test-recovery-sweep.ts` | **Ao vivo**: cria um documento `processing` há 15 min e outro `uploaded` há 10 min, sem nenhum job na fila, e deixa o scheduler resgatá-los | 5 de 5: um único scheduler apesar de 3 réplicas; os dois documentos concluídos; cada um processado 1× |
-| `backend/scripts/test-production-checks.ts` (`npm run prod-checks:test`) | **Offline**: a validação de configuração de produção — cada regra, o que é erro (aborta o boot) e o que é só aviso, e que fora de produção ela não interfere | 18 de 18 verificações passaram |
+| `backend/scripts/test-production-checks.ts` (`npm run prod-checks:test`) | **Offline**: a validação de configuração de produção — cada regra (inclui `OPENROUTER_DATA_COLLECTION=allow` e modelo `:free` como avisos, e `:free` + `deny` como aviso de que as análises vão falhar), o que é erro (aborta o boot) e o que é só aviso, e que fora de produção ela não interfere | 23 de 23 verificações passaram |
 | `backend/scripts/test-redis-tls.sh` | O backend contra um **Redis com TLS e senha** (certificados descartáveis, containers temporários): conexão `rediss://`, contador, rate limit, schedulers e um job consumido pelo worker do BullMQ, `/api/debug` desligado = 404, e três casos negativos (sem a CA, senha errada, política `allkeys-lru`) | 14 de 14 verificações passaram |
 | `backend/scripts/test-refresh-race.js` | **Ao vivo**, pela API (3 réplicas atrás do Nginx): N chamadas simultâneas a `/api/auth/refresh` com o MESMO cookie | Antes da correção: 8 chamadas, **5** deram certo e 5 tokens válidos sobraram. Depois: 1 dá certo e no máximo 1 token válido sobra, em 6, 12 e 18 chamadas paralelas |
 | `backend/scripts/test-frontend-single-flight.ts` (`npm run frontend-refresh:test`) | **Offline**: a renovação única do frontend (`fetch` falso que conta as chamadas) | 8 de 8: 6 renovações simultâneas = 1 requisição; 5 chamadas com token expirado = 1 renovação; sequenciais = 1 cada; a trava é liberada depois de uma falha |
@@ -1265,6 +1354,7 @@ entre elas e o limite de login vale somado.
 | `backend/scripts/test-resilient-throttler.ts` (`npm run throttler-resilient:test`) | **Offline**: rate limit com o Redis saudável, com erro, travado e voltando | 6 de 6 verificações passaram |
 | `backend/scripts/test-redis-down-live.js` | **Ao vivo**: derruba o Redis com 3 réplicas no ar e testa login, `/api/health`, `/api/health/ready`, rotas autenticadas e o rate limit | 8 de 8: com o Redis parado, o login responde `401` em ~1 s (antes travava), `/api/health` responde `200` em ~10 ms, `/api/health/ready` responde `503`, uma rota autenticada responde `200` (o cache de termos cai para o banco) e o rate limit continua valendo por réplica (429 na 10ª tentativa com 3 réplicas); com o Redis de volta, tudo normaliza e o contador volta a ser gravado nele |
 | `backend/scripts/test-uptime-check.js` (`npm run uptime:test`; com `LIVE=1` também contra o app real) | Monitor externo: servidor de saúde falso (200, 503, travado, porta fechada) e receptor de webhook; com `LIVE=1`, o `/api/health/ready` real com o Redis parado e religado | 13 de 13 offline; 16 de 16 com `LIVE=1`: um aviso por queda (sem repetir), "resolvido" na volta, oscilação de 2 falhas não alerta, travado estoura o timeout e não pendura, webhook fora não quebra |
+| `backend/scripts/test-load-light.js` | **Ao vivo, dentro do Compose** (Supabase e OpenRouter reais, 3 réplicas): 8 usuários × 2 documentos com IP próprio; mede latência de upload/leitura/lista/prontidão e tempo até o resultado | 7 de 7: 0 erros 5xx, 0 presos, upload p95 1,7 s, leitura p95 0,7 s; 15 `done` + 1 `error` (schema da IA). Ver Fase 10 |
 | `backend/scripts/test-e2e-http.js` | Pela API HTTP: cadastro, termos, login, 8 uploads simultâneos, leitura do resultado — sempre alternando réplicas | Tudo passou; 8 documentos, cada um processado 1× |
 | `backend/scripts/test-load-balancer.js` | Nginx: distribuição, contador, IP real e header forjado, upload grande, **dois dispositivos na mesma conta**, rate limit global, réplica morta, escala para 5 réplicas | 15 de 15 verificações passaram (distribuição 56/49/45; 0 falhas em 60 requisições com uma réplica morta; 5 réplicas usadas sem reiniciar o Nginx) |
 | Carga na camada da fila (3.000 jobs, 30.000 enqueues, 3 workers em containers separados) | O comportamento do BullMQ sob volume | 3.000 execuções exatas com a fila pausada na rajada; 286 duplicados sem pausar (ver Etapa 4). **O script não ficou no repositório** |
@@ -1358,7 +1448,8 @@ O que o repositório já traz para ir a produção:
   `SUPABASE_SERVICE_ROLE_KEY`, `JWT_PRIVATE_KEY`, `JWT_PUBLIC_KEY` ou
   `OPENROUTER_API_KEY` ausentes; `REDIS_URL` ausente, inválida ou apontando para
   `localhost` (em produção não há Redis na própria máquina). *Avisos que não
-  abortam:* Redis sem TLS (`redis://`) ou sem senha; `FRONTEND_URL` sem `https://`
+  abortam:* `OPENROUTER_DATA_COLLECTION=allow` (o provedor de IA pode treinar com os documentos; o termo avisa);
+  modelo `:free` (ou não definido) na OpenRouter (limite diário; com `deny` as análises falham); Redis sem TLS (`redis://`) ou sem senha; `FRONTEND_URL` sem `https://`
   (o cookie `secure` do refresh token não é enviado por HTTP); `TRUST_PROXY` desligado;
   `ENABLE_DEBUG_ENDPOINT=true`; `ALERT_WEBHOOK_URL` ausente (os alertas ficariam só no log).
 - **`backend/.env.production.example`**: modelo com todas as variáveis de produção

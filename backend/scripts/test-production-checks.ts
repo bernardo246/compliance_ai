@@ -12,6 +12,7 @@ const OK_ENV: Record<string, string> = {
   JWT_PRIVATE_KEY: 'p',
   JWT_PUBLIC_KEY: 'q',
   OPENROUTER_API_KEY: 'o',
+  OPENROUTER_MODEL: 'provedor/modelo-pago',
   REDIS_URL: 'rediss://default:senha@redis.exemplo.com:6380',
   FRONTEND_URL: 'https://app.exemplo.com',
   TRUST_PROXY: 'true',
@@ -70,6 +71,20 @@ for (const nome of ['SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY', 'JWT_PRIVATE_KE
   check('sem ALERT_WEBHOOK_URL é só aviso (os alertas ficariam só no log)', semAlerta.errors.length === 0 && tem(semAlerta.warnings, 'ALERT_WEBHOOK_URL'));
   const dbg = checkProductionConfig(com({ ENABLE_DEBUG_ENDPOINT: 'true' }));
   check('endpoint de debug ligado é aviso', dbg.errors.length === 0 && tem(dbg.warnings, 'ENABLE_DEBUG_ENDPOINT'));
+}
+
+// 6. privacidade do provedor de IA (modelo gratuito em produção é permitido, com avisos)
+{
+  const allow = checkProductionConfig(com({ OPENROUTER_DATA_COLLECTION: 'allow' }));
+  check('OPENROUTER_DATA_COLLECTION=allow em produção NÃO impede o boot (é uma escolha), mas avisa do treino', allow.errors.length === 0 && tem(allow.warnings, 'treino'), JSON.stringify(allow.errors));
+  const deny = checkProductionConfig(com({ OPENROUTER_DATA_COLLECTION: 'deny' }));
+  check('deny (ou ausente) com modelo pago: sem erros e sem avisos', deny.errors.length === 0 && deny.warnings.length === 0);
+  const freeAllow = checkProductionConfig(com({ OPENROUTER_MODEL: 'nvidia/nemotron-3-super-120b-a12b:free', OPENROUTER_DATA_COLLECTION: 'allow' }));
+  check('modelo ":free" + allow: sobe, com aviso do treino e do limite diário', freeAllow.errors.length === 0 && tem(freeAllow.warnings, 'treino') && tem(freeAllow.warnings, 'limite diário'));
+  const freeDeny = checkProductionConfig(com({ OPENROUTER_MODEL: 'nvidia/nemotron-3-super-120b-a12b:free' }));
+  check('modelo ":free" + deny: sobe, mas avisa que as análises vão falhar com 404', freeDeny.errors.length === 0 && tem(freeDeny.warnings, '404'));
+  const semModelo = checkProductionConfig(com({ OPENROUTER_MODEL: undefined }));
+  check('modelo não definido (cai no padrão grátis) também avisa', semModelo.errors.length === 0 && tem(semModelo.warnings, 'OPENROUTER_MODEL'));
 }
 
 const ok = resultados.every(Boolean);

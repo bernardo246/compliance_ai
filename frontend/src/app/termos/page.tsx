@@ -1,18 +1,21 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { Loader2, ShieldCheck } from 'lucide-react';
 import { useAuth } from '@/lib/auth-context';
 import { apiJson } from '@/lib/api';
 import { Navbar } from '@/components/Navbar';
+import { TermsContent } from '@/components/TermsContent';
 
-const TERMS_VERSION = process.env.NEXT_PUBLIC_TERMS_VERSION ?? '1.0.0';
+const TERMS_VERSION = process.env.NEXT_PUBLIC_TERMS_VERSION ?? '1.1.0';
 
 export default function TermosPage() {
   const { user, loading, refreshProfile } = useAuth();
   const router = useRouter();
   const [checked, setChecked] = useState(false);
+  const [textoPronto, setTextoPronto] = useState(false);
+  const onCarregado = useCallback(() => setTextoPronto(true), []);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -52,27 +55,8 @@ export default function TermosPage() {
           </div>
           <p className="mt-1 text-sm text-textSecondary">Versão {TERMS_VERSION}</p>
 
-          <div className="mt-6 max-h-72 space-y-4 overflow-y-auto rounded-xl border border-borderSoft bg-white/5 p-5 text-sm leading-relaxed text-textSecondary">
-            <p>
-              Ao usar esta plataforma, você concorda que os documentos enviados serão
-              processados por modelos de IA (Claude API) para geração de análises de
-              compliance e sugestões de melhoria, exclusivamente para a área de negócio
-              selecionada no envio.
-            </p>
-            <p>
-              Os arquivos enviados são armazenados de forma criptografada e excluídos
-              automaticamente após 72 horas. Você pode solicitar a exclusão imediata de
-              qualquer documento a qualquer momento.
-            </p>
-            <p>
-              Não enviamos seus documentos para treinamento de modelos de terceiros.
-              Todo o processamento é auditado e registrado em log interno para fins de
-              segurança e conformidade.
-            </p>
-            <p>
-              Você é responsável por garantir que possui autorização legal para enviar os
-              documentos processados na plataforma.
-            </p>
+          <div className="mt-6 max-h-96 overflow-y-auto rounded-xl border border-borderSoft bg-white/5 p-5">
+            <TermsContent onCarregado={onCarregado} />
           </div>
 
           <label className="mt-6 flex cursor-pointer items-start gap-3 text-sm text-textSecondary">
@@ -93,7 +77,7 @@ export default function TermosPage() {
 
           <button
             onClick={handleAccept}
-            disabled={!checked || submitting}
+            disabled={!checked || submitting || !textoPronto}
             className="btn-primary mt-6 flex w-full items-center justify-center gap-2"
           >
             {submitting && <Loader2 className="h-4 w-4 animate-spin" aria-hidden />}

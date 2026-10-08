@@ -94,7 +94,15 @@ export default function RegisterPage() {
           </button>
         </form>
 
-        <p className="mt-6 text-center text-sm text-textSecondary">
+        <p className="mt-6 text-center text-xs text-textSecondary">
+          Ao criar a conta você poderá ler e aceitar o{' '}
+          <Link href="/privacidade" className="text-brand hover:text-brandHover">
+            Termo de Uso e Privacidade
+          </Link>
+          .
+        </p>
+
+        <p className="mt-4 text-center text-sm text-textSecondary">
           Já tem conta?{' '}
           <Link href="/login" className="text-brand hover:text-brandHover">
             Entrar

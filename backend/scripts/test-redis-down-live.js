@@ -35,7 +35,7 @@ async function main() {
     const email = `redis-down+${Date.now()}@example.com`;
     const reg = await req('POST', '/api/auth/register', { json: { email, password: 'Senha-Teste-123!' } });
     userId = reg.corpo.user.id;
-    await req('POST', '/api/auth/accept-terms', { token: reg.corpo.accessToken, json: { version: process.env.TERMS_CURRENT_VERSION || '1.0.0' } });
+    await req('POST', '/api/auth/accept-terms', { token: reg.corpo.accessToken, json: { version: process.env.TERMS_CURRENT_VERSION || '1.1.0' } });
     const token = reg.corpo.accessToken;
     check('antes da queda: GET /api/documents responde 200', (await req('GET', '/api/documents', { token })).status === 200);
 

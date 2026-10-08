@@ -53,7 +53,7 @@ async function call(ip, method, path, { token, json, form } = {}) {
 
     const terms = await call(rep(1), 'POST', '/api/auth/accept-terms', {
       token: reg.data.accessToken,
-      json: { version: process.env.TERMS_CURRENT_VERSION || '1.0.0' },
+      json: { version: process.env.TERMS_CURRENT_VERSION || '1.1.0' },
     });
     check(
       `aceite de termos na ${label(rep(1))} (token emitido por outra réplica)`,

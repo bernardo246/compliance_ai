@@ -1,4 +1,4 @@
-const API_URL = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:3001';
+export const API_URL = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:3001';
 
 // access token vive só em memória (não em localStorage) — mitiga XSS.
 // O refresh token vive em cookie httpOnly, setado pelo backend.

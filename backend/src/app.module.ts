@@ -17,6 +17,7 @@ import { AnalysisModule } from './analysis/analysis.module';
 import { MonitoringModule } from './monitoring/monitoring.module';
 import { HealthController } from './health.controller';
 import { DebugController } from './common/debug/debug.controller';
+import { PrivacyController } from './privacy.controller';
 
 @Module({
   imports: [
@@ -54,7 +55,7 @@ import { DebugController } from './common/debug/debug.controller';
     AnalysisModule,
     MonitoringModule,
   ],
-  controllers: [HealthController, DebugController],
+  controllers: [HealthController, DebugController, PrivacyController],
   providers: [
     { provide: APP_GUARD, useClass: ThrottlerGuard },
     { provide: APP_GUARD, useClass: JwtAuthGuard },

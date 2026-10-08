@@ -77,6 +77,19 @@ export function checkProductionConfig(
     );
   }
 
+  if (env.OPENROUTER_DATA_COLLECTION === 'allow') {
+    warnings.push(
+      'OPENROUTER_DATA_COLLECTION=allow: os documentos dos usuários podem ser guardados e usados para treino pelo provedor de IA (é o que permite usar modelos ":free"). O Termo de Uso passa a informar isso sozinho (GET /api/privacy-info); confirme que o texto foi revisado com essa condição. Para impedir, use "deny" e um modelo pago.',
+    );
+  }
+  if (blank(env.OPENROUTER_MODEL) || env.OPENROUTER_MODEL!.trim().endsWith(':free')) {
+    warnings.push(
+      env.OPENROUTER_DATA_COLLECTION === 'allow'
+        ? 'OPENROUTER_MODEL é um modelo ":free" (ou não está definido): tem limite diário baixo (as análises passam a terminar em erro quando ele acaba) e não tem garantia de disponibilidade.'
+        : 'OPENROUTER_MODEL é um modelo ":free" (ou não está definido) com OPENROUTER_DATA_COLLECTION=deny: os endpoints gratuitos exigem permitir treino, então as análises vão falhar com 404. Defina OPENROUTER_DATA_COLLECTION=allow (e aceite o que o Termo de Uso passa a informar) ou use um modelo pago.',
+    );
+  }
+
   if (env.ENABLE_DEBUG_ENDPOINT === 'true') {
     warnings.push(
       'ENABLE_DEBUG_ENDPOINT=true: /api/debug/instance está ligado, público e fora do rate limit. Desligue em produção.',

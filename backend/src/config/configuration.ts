@@ -58,7 +58,7 @@ export default () => ({
   },
 
   terms: {
-    currentVersion: process.env.TERMS_CURRENT_VERSION ?? '1.0.0',
+    currentVersion: process.env.TERMS_CURRENT_VERSION ?? '1.1.0',
   },
 
   upload: {
@@ -104,6 +104,11 @@ export default () => ({
     // (filtre por "free") antes de usar — o valor abaixo é só um palpite
     // informado e pode não existir mais no catálogo deles quando você ler isso.
     model: process.env.OPENROUTER_MODEL ?? 'nvidia/nemotron-nano-9b-v2:free',
+    // Privacidade: 'deny' (padrão) manda a OpenRouter rotear SÓ para provedores que não
+    // guardam nem usam o prompt para treino. Os modelos ':free' não têm esse tipo de
+    // provedor (a chamada falha com 404 "No endpoints found matching your data policy").
+    // 'allow' só para desenvolvimento com modelo grátis; produção exige 'deny'.
+    dataCollection: process.env.OPENROUTER_DATA_COLLECTION === 'allow' ? 'allow' : 'deny',
     maxTokens: parseInt(process.env.OPENROUTER_MAX_TOKENS ?? '8000', 10),
     // Seção 8 da spec: timeout + retry com backoff para chamadas à API de IA.
     timeoutMs: parseInt(process.env.OPENROUTER_TIMEOUT_MS ?? '120000', 10),

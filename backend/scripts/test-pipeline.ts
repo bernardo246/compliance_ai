@@ -54,7 +54,7 @@ async function main() {
     const email = `pipeline-test+${documentId}@example.com`;
     const { data: user, error: userError } = await supabase
       .from('users')
-      .insert({ email, password_hash: 'x', terms_accepted: true, terms_version: '1.0.0' })
+      .insert({ email, password_hash: 'x', terms_accepted: true, terms_version: process.env.TERMS_CURRENT_VERSION || '1.1.0' })
       .select('id')
       .single();
     if (userError) throw new Error(`Falha ao criar usuário de teste: ${userError.message}`);

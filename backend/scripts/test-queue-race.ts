@@ -68,7 +68,7 @@ async function main() {
   try {
     const { data: user, error: uErr } = await supabase
       .from('users')
-      .insert({ email: `race-test+${runId}@example.com`, password_hash: 'x', terms_accepted: true, terms_version: '1.0.0' })
+      .insert({ email: `race-test+${runId}@example.com`, password_hash: 'x', terms_accepted: true, terms_version: process.env.TERMS_CURRENT_VERSION || '1.1.0' })
       .select('id')
       .single();
     if (uErr) throw new Error(`Falha ao criar usuário: ${uErr.message}`);
