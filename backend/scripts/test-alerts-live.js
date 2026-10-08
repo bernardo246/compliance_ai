@@ -1,6 +1,6 @@
 // Teste AO VIVO dos alertas de monitoramento (3 réplicas, Redis e Supabase reais).
 //
-// Pré-requisito: docker compose -f docker-compose.yml -f docker-compose.test.yml up -d --build
+// Pré-requisito: docker compose up -d --build
 // (o override liga o webhook em http://host.docker.internal:9099/hook, avaliação a
 // cada 10 s e repetição do mesmo alerta só depois de 60 s).
 //

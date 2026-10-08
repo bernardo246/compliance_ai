@@ -1,7 +1,7 @@
 /**
  * Teste AO VIVO da varredura periódica de documentos parados.
  *
- * Pré-requisito: docker compose -f docker-compose.yml -f docker-compose.test.yml up -d --build
+ * Pré-requisito: docker compose up -d --build
  * (3 réplicas, Redis em localhost:6379, varredura a cada 30 s).
  *
  * Cria dois documentos REALMENTE parados, sem nenhum job na fila:

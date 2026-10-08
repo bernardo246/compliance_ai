@@ -1,26 +1,28 @@
-# PRODUÇÃO — o que roda na VM. Segue a arquitetura de docs/arquitetura-producao.svg:
+# PRODUÇÃO — o que cada VM roda, atrás de um load balancer do provedor. Serve para 1 VM ou para várias.
 #
-#   internet ──HTTPS──► nginx ──► backend (N réplicas) ──► Redis gerenciado (REDIS_URL)
-#                                                      └──► Supabase, OpenRouter
+#   internet ──HTTPS──► load balancer ──HTTP──► VM 1: nginx ► backend (N réplicas) ─┐
+#                       (certificado, TLS)  └─► VM 2: nginx ► backend (N réplicas) ─┼► Redis gerenciado (único)
+#                                           └─► VM n ...                           ─┘   Supabase, OpenRouter
 #
-# O Redis NÃO está neste arquivo: em produção ele é um serviço gerenciado,
-# separado da VM (rede privada, TLS e senha); o backend o alcança pelo
-# REDIS_URL do .env.production. O banco e os arquivos ficam no Supabase.
+# Dois níveis de balanceamento: o do PROVEDOR reparte entre as VMs; o Nginx de cada VM reparte entre as
+# réplicas daquela VM. O estado (rate limit, fila, cache) já é compartilhado: Redis e Supabase ficam
+# FORA das VMs, então VMs podem entrar e sair sem perder nada. Todas as VMs usam o MESMO .env.production
+# (mesmas chaves JWT, mesmo REDIS_URL). O HTTPS e o certificado ficam no load balancer (a VM não tem
+# certificado nem porta 443); o Nginx confia no IP do cliente informado por ele, mas só vindo das faixas
+# dele: defina LB_TRUSTED_CIDRS (obrigatória; sem ela o Nginx não sobe).
 #
-# Antes de subir:
-#   1. cp backend/.env.production.example backend/.env.production   # e preencha
-#   2. coloque o certificado do domínio em ./certs (fullchain.pem e privkey.pem)
-#   3. docker compose -f docker-compose.prod.yml up -d --build
+# Antes de subir (em cada VM):
+#   1. cp backend/.env.production.example backend/.env.production   # e preencha (igual em todas as VMs)
+#   2. LB_TRUSTED_CIDRS="faixa1,faixa2" docker compose -f docker-compose.prod.yml up -d --build
+#      (as faixas são as de ORIGEM das conexões do load balancer ao backend; no README há como achar)
+#   3. firewall da VM: porta 80 aberta SÓ para essas faixas (e para os health checks do load balancer).
+#   4. no load balancer: health check em GET /api/health (liveness; NÃO use /api/health/ready: se o Redis
+#      cair, todas as VMs sairiam da rotação juntas e o app inteiro ficaria fora, em vez de degradado).
 #
-# Número de réplicas do backend (padrão 2):
-#   BACKEND_REPLICAS=3 docker compose -f docker-compose.prod.yml up -d --build
-#
-# Para usar uma imagem já publicada em um registry em vez de buildar na VM:
-#   BACKEND_IMAGE=registry.exemplo.com/compliance-backend:1.0.0 \
-#     docker compose -f docker-compose.prod.yml up -d --no-build
-#
-# Faça o build NA VM (ou com --platform linux/amd64): uma imagem construída em
-# um Mac com chip Apple é arm64 e não roda em uma VM x86.
+# Número de réplicas por VM (padrão 2): BACKEND_REPLICAS=3 ... up -d --build
+# Imagem já publicada em um registry em vez de buildar na VM:
+#   BACKEND_IMAGE=registry.exemplo.com/compliance-backend:1.0.0 docker compose -f docker-compose.prod.yml up -d --no-build
+# Faça o build NA VM (ou com --platform linux/amd64): imagem de Mac com chip Apple é arm64 e não roda em VM x86.
 
 services:
   backend:
@@ -53,12 +55,14 @@ services:
   nginx:
     image: nginx:1.27-alpine
     restart: unless-stopped
+    environment:
+      LB_TRUSTED_CIDRS: ${LB_TRUSTED_CIDRS:?defina LB_TRUSTED_CIDRS com as faixas de IP do load balancer, separadas por vírgula}
     volumes:
       - ./nginx/nginx.prod.conf:/etc/nginx/conf.d/default.conf:ro
-      - ./certs:/etc/nginx/certs:ro
+      # A imagem do Nginx executa os .sh de /docker-entrypoint.d/ antes de iniciar.
+      - ./nginx/lb-trusted-proxies.sh:/docker-entrypoint.d/40-lb-trusted-proxies.sh:ro
     ports:
       - "80:80"
-      - "443:443"
     depends_on:
       backend:
         condition: service_healthy

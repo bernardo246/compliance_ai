@@ -6,7 +6,7 @@
 //      o job de retenção é disparado pela fila e só os expirados somem
 //   3. janela dos revogados (1 h por padrão): revogado de 2 h atrás some, o de 10 min fica
 //
-// Pré-requisito: docker compose -f docker-compose.yml -f docker-compose.test.yml up -d --build
+// Pré-requisito: docker compose up -d --build
 //   node backend/scripts/test-db-load-live.js
 require('dotenv').config({ path: require('path').join(__dirname, '..', '.env'), quiet: true });
 const { randomUUID, randomBytes } = require('crypto');

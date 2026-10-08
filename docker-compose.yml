@@ -1,7 +1,8 @@
-# Fase 7 — ambiente local que simula múltiplas réplicas do backend
-# compartilhando um único Redis pela rede do Docker (não por localhost).
+# LOCAL E TESTES (produção é o docker-compose.prod.yml). Simula múltiplas réplicas do
+# backend compartilhando um único Redis pela rede do Docker (não por localhost).
 #
-#   docker compose up -d --build        # sobe Redis + 3 réplicas
+#   docker compose up -d --build        # sobe Redis + 3 réplicas + Nginx
+#   docker compose up -d redis          # só o Redis (para rodar o backend com npm run start:dev)
 #   docker compose up -d --scale backend=5   # muda o número de réplicas
 #   docker compose down                 # derruba tudo (o volume do Redis fica)
 #
@@ -41,6 +42,17 @@ services:
       # Só o ambiente local liga o endpoint de diagnóstico /api/debug/instance
       # (usado pelos testes de load balancer). Em produção fica desligado (404).
       ENABLE_DEBUG_ENDPOINT: "true"
+      # Ajustes para os scripts de teste (backend/scripts/test-*.js|ts) não esperarem minutos.
+      # Em produção valem os padrões (5 min de varredura, alertas a cada 1 min, repetição em 30 min).
+      ANALYSIS_RECOVERY_INTERVAL_MS: "30000"
+      ALERT_CHECK_INTERVAL_MS: "10000"
+      ALERT_COOLDOWN_MS: "60000"
+      # Webhook de alertas = o receptor local que test-alerts-live.js sobe na porta 9099 (sobrescreve o
+      # do .env: o ambiente local nunca avisa o canal real).
+      ALERT_WEBHOOK_URL: "http://host.docker.internal:9099/hook"
+      ALERT_WEBHOOK_FORMAT: "generic"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       redis:
         condition: service_healthy

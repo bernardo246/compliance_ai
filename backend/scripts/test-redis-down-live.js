@@ -2,7 +2,7 @@
 // Antes da correção, todas as rotas travavam (o rate limit esperava o Redis, até o /api/health).
 // Agora a API segue respondendo e o rate limit degrada para contadores em memória por réplica.
 //
-// Pré-requisito: docker compose -f docker-compose.yml -f docker-compose.test.yml up -d --build
+// Pré-requisito: docker compose up -d --build
 //   node backend/scripts/test-redis-down-live.js
 require('dotenv').config({ path: require('path').join(__dirname, '..', '.env'), quiet: true });
 const { execSync } = require('child_process');

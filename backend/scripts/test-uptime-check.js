@@ -1,7 +1,7 @@
 // Teste do monitor externo (scripts/uptime-check.js) com um servidor de saúde FALSO e um
 // receptor de webhook local: não precisa de Docker nem de Supabase.
-// Opcional, com LIVE=1 e o compose de testes no ar (docker compose -f docker-compose.yml
-// -f docker-compose.test.yml up -d --build): confere também contra o /api/health/ready real,
+// Opcional, com LIVE=1 e o compose local no ar (docker compose up -d --build):
+// confere também contra o /api/health/ready real,
 // parando e religando o Redis.
 //   node backend/scripts/test-uptime-check.js
 //   LIVE=1 node backend/scripts/test-uptime-check.js

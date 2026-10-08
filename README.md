@@ -86,12 +86,12 @@ projeto-analise-ia/
 │   ├── test-fixtures/     # 12 PDFs de teste (2 por área) com problemas conhecidos injetados
 │   └── sql/               # 001_init + 002_analysis_pipeline + 003_retention + 004_scale_indexes.sql (rodar no Supabase, em ordem)
 ├── nginx/nginx.conf        # Escalabilidade — load balancer na frente das réplicas (local, HTTP)
-├── nginx/nginx.prod.conf   # Produção — Nginx como borda da VM: HTTPS + balanceamento
-├── certs/                  # Certificado TLS do Nginx de produção (fullchain.pem, privkey.pem — ignorados pelo git)
-├── docs/arquitetura-producao.svg  # Diagrama da arquitetura de produção (embutido abaixo)
-├── docker-compose.yml      # Escalabilidade — Redis + N réplicas do backend + Nginx (porta 8080)
-├── docker-compose.test.yml # Override só p/ testes: expõe o Redis em localhost:6379
-├── docker-compose.prod.yml # Produção (o que roda na VM): Nginx com HTTPS + N réplicas do backend; Redis gerenciado fora
+├── nginx/nginx.prod.conf   # Produção — Nginx de cada VM, atrás do load balancer do provedor (só HTTP)
+├── nginx/lb-trusted-proxies.sh  # Gera as faixas de IP do balanceador em quem o Nginx confia (LB_TRUSTED_CIDRS)
+├── certs/                  # Só se o Redis gerenciado usar CA própria (redis-ca.pem; ignorado pelo git)
+├── docs/arquitetura-producao-multi-vm.svg  # Diagrama da arquitetura de produção (embutido abaixo)
+├── docker-compose.yml      # LOCAL E TESTES — Redis + 3 réplicas do backend + Nginx (porta 8080)
+├── docker-compose.prod.yml # PRODUÇÃO (cada VM, atrás do load balancer): Nginx + N réplicas do backend; Redis gerenciado fora
 └── frontend/               # Next.js 16 (App Router)
     └── src/
         ├── app/
@@ -979,7 +979,7 @@ lista, prontidão) respondeu em menos de 1,7 s no pior caso. As latências inclu
 testei mais usuários que isso, nem arquivos grandes (os de teste têm ~2 KB), nem com modelo pago.
 
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.test.yml up -d --build
+docker compose up -d --build
 docker compose run --rm --no-deps -T -e NODE_PATH=/app/node_modules -e USERS=8 -e DOCS_PER_USER=2 \
   -v "$PWD/backend/scripts:/t:ro" -v "$PWD/backend/test-fixtures:/fx:ro" backend node /t/test-load-light.js
 ```
@@ -1024,9 +1024,10 @@ mesma fila e o mesmo agendamento.
 
 | Arquivo | Para quê | O que sobe |
 |---|---|---|
-| `docker-compose.yml` | **Desenvolvimento local** | Redis (porta 6379 aberta só em `127.0.0.1`) + 3 réplicas do backend + Nginx em `http://localhost:8080` |
-| `docker-compose.test.yml` | **Só os scripts de teste** (complemento do anterior) | Alertas e varredura em intervalos curtos, webhook local em `:9099`. Nunca em produção |
-| `docker-compose.prod.yml` | **Deploy** | Nginx com HTTPS (80/443) + backend (`BACKEND_REPLICAS`, padrão 2). **Sem Redis**: o `REDIS_URL` vem do `backend/.env.production` e aponta para o Redis gerenciado (`rediss://...`) |
+| `docker-compose.yml` | **Local e testes** | Redis (porta 6379 aberta só em `127.0.0.1`) + 3 réplicas do backend + Nginx em `http://localhost:8080`. Já vem com os ajustes dos scripts de teste (varredura de 30 s, alertas a cada 10 s, webhook local em `:9099`): não use em produção |
+| `docker-compose.prod.yml` | **Produção** (rode em cada VM, atrás de um load balancer do provedor; serve para 1 VM ou várias) | Nginx só em HTTP (80) + backend (`BACKEND_REPLICAS`, padrão 2). O HTTPS e o certificado ficam no load balancer. Exige `LB_TRUSTED_CIDRS`. **Sem Redis**: o `REDIS_URL` vem do `backend/.env.production` e aponta para o Redis gerenciado (`rediss://...`). Ver "Várias VMs atrás de um load balancer" |
+
+São só dois arquivos, de propósito: um para local/testes e um para produção.
 
 Dois modos de rodar localmente:
 
@@ -1310,8 +1311,7 @@ volume, para a fila sobreviver a um restart) e `backend` com `replicas: 3`,
 healthchecks e `depends_on` com `service_healthy`. O backend não publica porta
 (várias réplicas não dividem uma porta do host). O `env_file` do Compose remove as
 aspas das chaves JWT do `.env`, o que `docker run --env-file` não faz.
-`docker-compose.test.yml` é um override só de testes que expõe o Redis em
-`localhost:6379`. **Provado:** as 3 réplicas conectam no mesmo Redis (nome do
+O Redis do Compose também fica acessível em `localhost:6379` (só na própria máquina). **Provado:** as 3 réplicas conectam no mesmo Redis (nome do
 serviço, não `localhost`), o contador de `/api/debug/instance` sobe sem repetir
 entre elas e o limite de login vale somado.
 
@@ -1362,7 +1362,7 @@ entre elas e o limite de login vale somado.
 ```bash
 # queue-race, double-stall e recovery-sweep rodam no host e precisam do Redis exposto
 # (o override de teste também encurta a varredura periódica para 30 s):
-docker compose -f docker-compose.yml -f docker-compose.test.yml up -d --build
+docker compose up -d --build
 cd backend
 TS_NODE_FILES=true npx ts-node scripts/test-queue-race.ts            # N_DOCS=20 para o teste maior
 TS_NODE_FILES=true npx ts-node scripts/test-queue-race.ts --kill     # derruba uma réplica no meio
@@ -1436,9 +1436,11 @@ rodar: confira o Supabase por usuários `race-test+`, `stall-test+`, `sweep-test
 
 ### Preparação para produção (feita no repositório, sem criar nada na nuvem)
 
-Arquitetura alvo de produção (o Redis é um serviço gerenciado, **fora** da VM, na mesma rede privada):
+Arquitetura alvo de produção: um load balancer do provedor reparte entre as VMs, o Nginx de cada VM reparte entre as
+réplicas do backend, e o Redis gerenciado, o Supabase e a OpenRouter são compartilhados por todas as VMs (o Redis fica
+**fora** das VMs, na mesma rede privada). Com uma só VM vale o mesmo desenho, com uma VM atrás do load balancer (o certificado fica nele):
 
-![Arquitetura de produção](docs/arquitetura-producao.svg)
+![Arquitetura de produção](docs/arquitetura-producao-multi-vm.svg)
 
 O que o repositório já traz para ir a produção:
 
@@ -1455,24 +1457,20 @@ O que o repositório já traz para ir a produção:
 - **`backend/.env.production.example`**: modelo com todas as variáveis de produção
   (segredos como placeholders). Copie para `backend/.env.production` (ignorado pelo
   git) ou cadastre cada variável no painel do provedor.
-- **`docker-compose.prod.yml`** — o que roda na VM, conforme o diagrama acima:
-  - `nginx`: borda da VM, escuta 80 e 443, redireciona HTTP para HTTPS e reparte as
-    requisições entre as réplicas (`nginx/nginx.prod.conf`, com o certificado em `./certs`).
-    Por ser a borda, **sobrescreve** o `X-Forwarded-For` com o IP de quem conectou.
+- **`docker-compose.prod.yml`** — o que roda em cada VM, conforme o diagrama acima:
+  - `nginx`: escuta só a porta 80 (HTTP) e reparte as requisições entre as réplicas
+    (`nginx/nginx.prod.conf`). O HTTPS e o certificado ficam no load balancer do provedor, não na VM. O IP do
+    cliente vem do balanceador, mas só de quem estiver em `LB_TRUSTED_CIDRS` (ver "Várias VMs atrás de um load balancer").
   - `backend`: N réplicas (`BACKEND_REPLICAS`, padrão 2), `TRUST_PROXY=true` e
     `ENABLE_DEBUG_ENDPOINT=false` fixos, healthcheck, limite de memória e CPU por réplica.
   - Os dois com `restart: unless-stopped`.
   - **Sem Redis no Compose**: o `REDIS_URL` do `.env.production` aponta para o serviço
     gerenciado. Se ele usar uma CA própria (não pública), descomente as 3 linhas indicadas
     no arquivo e coloque a CA em `./certs/redis-ca.pem`.
-  - Suba com `docker compose -f docker-compose.prod.yml up -d --build`; faça o build **na VM**
+  - Suba com `LB_TRUSTED_CIDRS="..." docker compose -f docker-compose.prod.yml up -d --build`; faça o build **na VM**
     (uma imagem construída em um Mac com chip Apple é arm64 e não roda em uma VM x86).
-- **Certificado do Nginx:** o compose espera `./certs/fullchain.pem` e `./certs/privkey.pem`
-  (sem eles o Nginx não sobe). Quem emite é um passo à parte. Exemplo com Let's Encrypt,
-  **não executado aqui** (precisa de um domínio público apontando para a VM), antes de subir o compose:
-  `docker run --rm -p 80:80 -v "$PWD/le:/etc/letsencrypt" certbot/certbot certonly --standalone -d api.seudominio.com`,
-  e copiar `le/live/api.seudominio.com/{fullchain,privkey}.pem` para `./certs/`. A renovação
-  (a cada ~60 dias) precisa parar o Nginx por alguns segundos ou usar o modo `--webroot`.
+- **Certificado:** fica no load balancer do provedor (certificado gerenciado e renovação automática, na maioria
+  dos provedores), então não há certificado, `certbot` nem porta 443 na VM.
 - **`/api/debug` desligado por padrão** (404).
 - **Redis com TLS e senha**: não foi preciso mudar código. O `ioredis` (e o BullMQ, que o
   usa) entende `rediss://usuario:senha@host:porta`. Com a CA do provedor pública não há
@@ -1482,28 +1480,26 @@ O que o repositório já traz para ir a produção:
 
 **Como foi verificado** (tudo local, com certificados e containers descartáveis):
 `npm run prod-checks:test` (17/17), `test-redis-tls.sh` (14/14) e a imagem de produção
-rodando de verdade pelo `docker-compose.prod.yml` contra um Redis com TLS e senha:
+rodando de verdade por uma versão anterior do `docker-compose.prod.yml` (a do bloco `backend`, que não mudou) contra um Redis com TLS e senha:
 saudável, processo como usuário `node`, `NODE_ENV=production`, **nenhum aviso de
 configuração**, conectado ao Redis por TLS, `/api/health` = 200, `/api/debug/instance` =
 404, rate limit funcionando e 16 chaves do BullMQ gravadas no Redis. Configuração quebrada
 aborta com código 1 (sem as variáveis obrigatórias, e com `REDIS_URL` em `localhost`); configuração
 só arriscada (Redis sem TLS/senha, `FRONTEND_URL` http, `TRUST_PROXY` off, debug ligado) apenas avisa.
 
-**O compose de produção em si** (`docker-compose.prod.yml`, testado localmente com certificado
-autoassinado e o Redis com TLS e senha, usando as instruções de CA privada do próprio arquivo):
-HTTP responde `301` para HTTPS; HTTPS responde `200` com HTTP/2 e TLS 1.3; `/api/debug/instance` = `404`;
-as 2 réplicas conectaram no Redis por TLS e subiram sem nenhum aviso de configuração; o rate limit
-vale pelo HTTPS (5 respostas `401` e depois `429`); o IP gravado na auditoria é o de quem conectou e
-**não** o do `X-Forwarded-For` forjado; um `SIGKILL` no processo `node` de uma réplica foi seguido de reinício
-automático (`restart: unless-stopped`) e a réplica voltou saudável; `BACKEND_REPLICAS=3` escalou para 3
-réplicas sem reiniciar o Nginx. Um detalhe do teste: `docker kill` conta como parada manual e **não**
-dispara o reinício automático, então não serve para simular uma queda (o `SIGKILL` no processo, sim).
+**O compose de produção em si.** Uma versão anterior, com o HTTPS no Nginx da própria VM (certificado em `./certs`),
+foi testada localmente com certificado autoassinado e o Redis com TLS e senha: as 2 réplicas conectaram no Redis por TLS e
+subiram sem nenhum aviso de configuração; o rate limit valeu pelo HTTPS (5 respostas `401` e depois `429`); um `SIGKILL`
+no processo `node` de uma réplica foi seguido de reinício automático (`restart: unless-stopped`) e a réplica voltou
+saudável; `BACKEND_REPLICAS=3` escalou para 3 réplicas sem reiniciar o Nginx. (`docker kill` conta como parada manual e
+**não** dispara o reinício automático; o `SIGKILL` no processo, sim.) **Essa versão foi substituída** pelo desenho com
+load balancer do provedor: o bloco `backend` é o mesmo, mas a parte do Nginx mudou (agora só HTTP, sem certificado) e
+**não foi retestada em execução**, só validada por configuração (ver "Várias VMs atrás de um load balancer"). O que
+dependia do HTTPS no Nginx (redirecionamento 301, HTTP/2, TLS 1.3) deixou de existir na VM.
 
 **O que NÃO foi verificado** (precisa de conta e infraestrutura reais):
 
-- **A emissão real do certificado** (Let's Encrypt ou do provedor) e a renovação.
-- O que acontece com o Nginx **sem** os certificados em `./certs` (pela documentação do Nginx, ele
-  não sobe; não testei).
+- **O certificado no load balancer do provedor** (emissão e renovação).
 
 - Um **Redis gerenciado de verdade**. Só foi testado um Redis com TLS e senha local.
   Provedores variam: alguns restringem comandos administrativos (o aviso de eviction
@@ -1513,6 +1509,70 @@ dispara o reinício automático, então não serve para simular uma queda (o `SI
   (o `trust proxy 1` assume um único salto).
 - Cookie `secure` por HTTPS no navegador (o teste de produção não passou por um
   frontend em HTTPS).
+
+### Várias VMs atrás de um load balancer
+
+São **dois níveis** de balanceamento, cada um com um papel:
+
+| Nível | Quem | O que reparte | Se falhar |
+|---|---|---|---|
+| Externo | Load balancer **do provedor** | As requisições entre as **VMs** | Uma VM que falha no health check sai do rodízio e as outras assumem |
+| Interno | **Nginx** dentro de cada VM | As requisições entre as **réplicas** (containers) daquela VM | Uma réplica que cai sai da rotação |
+
+(O diagrama dessa arquitetura está em "Preparação para produção", acima.)
+
+O estado já é todo compartilhado fora das VMs (Redis gerenciado e Supabase), então as VMs são **intercambiáveis**: dá
+para ligar, desligar ou acrescentar uma sem perder fila, rate limit ou cache. Nada no código do backend mudou para isso.
+
+**Arquivos:** `docker-compose.prod.yml` (o que cada VM roda, de 1 a N VMs), `nginx/nginx.prod.conf` (Nginx da VM: só HTTP, sem
+certificado) e `nginx/lb-trusted-proxies.sh` (gera, a partir de `LB_TRUSTED_CIDRS`, as faixas em quem o Nginx confia).
+
+**Passo a passo (em cada VM):**
+
+1. **Mesmo `backend/.env.production` em todas as VMs** (mesmas chaves JWT e mesmo `REDIS_URL`).
+2. Suba com as faixas do load balancer:
+   `LB_TRUSTED_CIDRS="faixa1,faixa2" docker compose -f docker-compose.prod.yml up -d --build`.
+   Sem `LB_TRUSTED_CIDRS` o Nginx **não sobe** (de propósito, abaixo).
+3. **Load balancer do provedor:** porta pública 443 com o certificado do provedor (ele também redireciona 80 → 443);
+   backend = as VMs, porta 80, protocolo HTTP.
+4. **Health check do load balancer em `GET /api/health`** (liveness). **Não** use `/api/health/ready`: se o Redis ou o
+   banco cair, todas as VMs falhariam juntas, sairiam do rodízio ao mesmo tempo e o app inteiro ficaria fora, em vez
+   de degradado.
+5. **Firewall da VM:** porta 80 aberta só para as faixas do load balancer (e do health check). A VM não precisa de IP
+   público de entrada.
+6. **Timeout do backend no load balancer:** deixe pelo menos 60 s (o Nginx da VM espera até 120 s). A análise da IA é
+   assíncrona, então nenhuma requisição fica aberta esse tempo, mas uploads grandes em conexão lenta precisam de folga.
+   Confira também se o load balancer aceita corpo de 20 MB.
+7. Aponte o DNS da API (`api.seudominio.com`) para o IP do load balancer, não para as VMs. O `HEALTH_URL` do monitor
+   externo também usa esse endereço.
+
+**`LB_TRUSTED_CIDRS` (a parte que mais importa):** o rate limit e a auditoria usam o IP do usuário. Com um load balancer
+na frente, o IP que chega ao Nginx é o do balanceador; o IP do usuário vem no cabeçalho `X-Forwarded-For`, que o
+balanceador preenche. O Nginx só acredita nesse cabeçalho se a conexão vier de uma faixa de `LB_TRUSTED_CIDRS` (ele pula,
+da direita para a esquerda, os IPs que são do balanceador e fica com o primeiro que não é). Qualquer outra origem tem o
+cabeçalho ignorado, então ninguém consegue forjar o IP, nem batendo direto na VM. O que listar depende do provedor
+(**confirme na documentação dele**):
+
+- as faixas de **origem** das conexões do balanceador até a VM (as mesmas que o firewall e o health check já liberam);
+- **e**, se o balanceador acrescentar o **próprio IP** ao `X-Forwarded-For` (alguns acrescentam o IP do cliente e depois o
+  IP público do balanceador), esse IP público como `/32`. Sem ele o Nginx o tomaria por IP do cliente.
+- Erro nesta lista não derruba o app, mas **deixa o rate limit e a auditoria com o IP errado** (todos os usuários como um
+  só, ou forjável). Por isso, depois do primeiro deploy, confira nos logs de auditoria (`audit_logs.ip_address`) se aparece
+  o IP real do usuário e não o do balanceador.
+
+**Atualizar sem derrubar o app (rolling):** em uma VM por vez, `git pull` e
+`LB_TRUSTED_CIDRS=... docker compose -f docker-compose.prod.yml up -d --build`; espere o health check voltar a passar
+antes de ir para a próxima. Enquanto uma VM reinicia, o balanceador manda o tráfego para as outras.
+
+**Conexões com o Redis:** cada réplica abre várias (cliente compartilhado mais as do BullMQ por fila e worker). Com
+várias VMs, some `VMs × réplicas` e confira o limite de conexões do plano do Redis gerenciado.
+
+**O que foi e o que não foi verificado:** o único teste possível aqui é de **configuração** e foi feito: o Nginx aceita
+`nginx.prod.conf` (`nginx -t`), o script gera as faixas, **recusa subir** sem `LB_TRUSTED_CIDRS` e recusa texto que tente
+injetar diretivas (saída 1), e o `docker compose config` do arquivo é válido. **Não foi testado** (só dá para fazer no
+provedor real): a distribuição entre VMs, a retirada de uma VM do rodízio quando ela falha, o IP do cliente atravessando o
+balanceador real e o certificado. Eu havia começado uma simulação local de balanceador e removi: ela provaria o
+comportamento do meu Nginx de teste, não o do balanceador do provedor.
 
 ### Migrar para produção — passo a passo (NÃO feito)
 
@@ -1526,15 +1586,13 @@ gerenciado, não um container.
    conexões do plano — cada réplica abre várias (cliente compartilhado mais as conexões
    do BullMQ por fila e worker).
 2. **Réplicas na VM:** use o `docker-compose.prod.yml` (acima): `.env.production` a partir do
-   `.env.production.example` (**gere um par de chaves JWT novo**), certificado em `./certs`, e
-   `docker compose -f docker-compose.prod.yml up -d --build` na própria VM. Alternativa: publicar
+   `.env.production.example` (**gere um par de chaves JWT novo**) e
+   `LB_TRUSTED_CIDRS="..." docker compose -f docker-compose.prod.yml up -d --build` na própria VM. Alternativa: publicar
    a imagem em um registry e rodá-la direto no provedor, com as variáveis no painel.
-3. **Mais de uma VM, ou um load balancer/CDN na frente do Nginx:** o `nginx.prod.conf` assume que
-   ele é a borda e sobrescreve o `X-Forwarded-For`; com outro proxy na frente, ele passaria a
-   registrar o IP desse proxy em vez do cliente. Nesse caso é preciso mudar o Nginx (confiar no
-   cabeçalho do proxy conhecido, via `real_ip`) e conferir o número de saltos do `trust proxy`
-   (hoje 1). O frontend e a API devem ficar sob o mesmo domínio raiz (o cookie do refresh token
-   é `SameSite=strict`).
+3. **Load balancer do provedor na frente das VMs** (de 1 a N): seção "Várias VMs atrás de um load balancer"
+   (certificado, health check em `/api/health`, firewall, `LB_TRUSTED_CIDRS`). O Nginx da VM confia no IP do cliente
+   só vindo das faixas do balanceador; sem `LB_TRUSTED_CIDRS` ele não sobe. O frontend e a API devem ficar sob o
+   mesmo domínio raiz (o cookie do refresh token é `SameSite=strict`).
 4. **`NODE_ENV=production` exige HTTPS:** o cookie do refresh token passa a ser
    `secure`. Localmente o container usa `NODE_ENV=development` (vem do `.env`).
 5. **Antes de ir:** subir uma vez com a validação de produção (ela lista o que está
@@ -1569,7 +1627,7 @@ hoje.
 |---|---|---|---|---|
 | **ClamAV** (`clamd`) | Scanner de vírus/malware por assinatura no upload de documentos (Fase 8) | `MalwareScanService` + `clamav.client.ts` (`src/documents/security/`), atrás de `ANTIVIRUS_ENABLED` | `docker run -p 3310:3310 clamav/clamav`, depois `ANTIVIRUS_ENABLED=true` + `CLAMAV_HOST`/`CLAMAV_PORT` no `.env` — é um switch, o código já fala o protocolo `INSTREAM` de verdade | Só a heurística estática de PDF roda (cobre os vetores mais comuns de PDF malicioso, mas não é um scanner de assinaturas) |
 | **Reverse proxy / load balancer** | Distribuir requisições entre as réplicas e terminar HTTPS; pré-requisito pra `TRUST_PROXY=true` fazer sentido | Local: `nginx/nginx.conf` + serviço `nginx` do Compose (simulação, porta 8080). `TRUST_PROXY` em `configuration.ts`/`main.ts` | Local: `docker compose up -d --build`. Produção (VM): `nginx/nginx.prod.conf` com HTTPS, pelo `docker-compose.prod.yml`; um load balancer do provedor na frente exige mudar o Nginx (ver "Migrar para produção"); só ligue `TRUST_PROXY=true` depois de confirmar que existe um proxy de fato na frente | Sem proxy, `req.ip` usa o IP direto da conexão TCP — correto em dev local e em deploy sem proxy na frente |
-| **Docker / Docker Compose** | Rodar Redis, as réplicas do backend e o Nginx juntos na máquina | `backend/Dockerfile`, `docker-compose.yml`, `docker-compose.test.yml` | Instalar o Docker Desktop; `docker compose up -d --build` | O backend roda com `npm run start:dev`, mas precisa de um Redis em `REDIS_URL` e só tem 1 instância |
+| **Docker / Docker Compose** | Rodar Redis, as réplicas do backend e o Nginx juntos na máquina | `backend/Dockerfile`, `docker-compose.yml`, `docker-compose.prod.yml` | Instalar o Docker Desktop; `docker compose up -d --build` | O backend roda com `npm run start:dev`, mas precisa de um Redis em `REDIS_URL` e só tem 1 instância |
 | **`pg_cron`** (extensão nativa do Supabase) | Alternativa ao Redis pra agendar a retenção da Fase 7 **sem infraestrutura nova** — roda dentro do próprio Postgres do Supabase | Mencionado como opção na seção "Para escalar" da Fase 7 (a opção adotada foi o job repetível do BullMQ) | Habilitar a extensão no painel do Supabase e mover a lógica de `RetentionService.purgeExpired()` pra uma function SQL agendada | Não é necessária: a retenção já roda como job repetível do BullMQ |
 
 > Em produção, vale também considerar um **secrets manager** do provedor de

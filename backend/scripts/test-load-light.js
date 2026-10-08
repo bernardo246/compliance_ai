@@ -7,7 +7,7 @@
 // usuários ao mesmo tempo", dentro do que o modelo gratuito de IA aguenta.
 //
 // Roda DENTRO da rede do Compose (a imagem não leva scripts/ nem fixtures; monta-se as pastas):
-//   docker compose -f docker-compose.yml -f docker-compose.test.yml up -d --build
+//   docker compose up -d --build
 //   docker compose run --rm --no-deps -T -e NODE_PATH=/app/node_modules \
 //     -e USERS=8 -e DOCS_PER_USER=2 \
 //     -v "$PWD/backend/scripts:/t:ro" -v "$PWD/backend/test-fixtures:/fx:ro" \
