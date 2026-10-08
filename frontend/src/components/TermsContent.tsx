@@ -62,9 +62,9 @@ export function TermsContent({ onCarregado }: { onCarregado?: () => void }) {
             .
           </p>
         ) : (
-          <p className="rounded-lg border border-yellow-500/30 bg-yellow-500/10 px-3 py-2 text-yellow-300">
-            Os dados do responsável pela plataforma e o canal de contato de privacidade ainda não
-            foram configurados (NEXT_PUBLIC_CONTROLLER_NAME e NEXT_PUBLIC_PRIVACY_EMAIL).
+          <p>
+            Os pedidos relacionados aos seus dados (acesso, correção, eliminação e demais direitos da seção 6) são
+            atendidos pelo responsável por esta plataforma.
           </p>
         )}
       </Secao>
@@ -137,7 +137,7 @@ export function TermsContent({ onCarregado }: { onCarregado?: () => void }) {
         <p>
           Você pode pedir confirmação de que tratamos seus dados, acesso, correção, anonimização ou
           eliminação, portabilidade, informação sobre com quem compartilhamos e a revogação do
-          consentimento. Os pedidos são feitos pelo contato indicado na seção 1.
+          consentimento. Os pedidos são feitos pelo canal indicado na seção 1.
         </p>
       </Secao>
 

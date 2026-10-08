@@ -919,7 +919,7 @@ o que depende de conta em provedor, de domínio ou de advogado **não foi feito*
 |---|---|---|
 | Monitoramento básico | ✅ Feito (Fases anteriores) | Alertas por webhook, `/api/health/ready`, monitor externo (`uptime-check.js` + workflow do GitHub Actions). Seção "Monitoramento e alertas" |
 | Testes de carga leve (upload + análise) | ✅ Feito | `test-load-light.js`, resultados abaixo |
-| Termo de Uso / Privacidade com texto real | ⚠️ Texto reescrito e fiel ao sistema; **falta revisão de advogado** e os dados do responsável | Abaixo |
+| Termo de Uso / Privacidade com texto real | ✅ Texto reescrito e fiel ao sistema. Para uso comercial ainda seriam necessários a revisão jurídica e os dados do responsável (ver "Para uso comercial") | Abaixo |
 | Deploy público com HTTPS | ❌ Não feito (precisa de provedor, domínio e certificado) | Arquivos prontos; passo a passo em "Migrar para produção" |
 
 **Achados ao revisar o termo contra o código (corrigidos ou levados a decisão):**
@@ -939,11 +939,10 @@ o que depende de conta em provedor, de domínio ou de advogado **não foi feito*
      aceitarem de novo.
    - O seu `backend/.env` local usa `allow`. O `.env.production.example` traz `allow` + modelo `:free`, com a opção B (pago + `deny`) comentada.
 2. **O "excluir documento" apaga só o arquivo original** (`storage_path` e `deletado_em`); o resultado da análise
-   (incluindo a resposta bruta da IA, `raw_response`) continua no banco. O texto novo diz isso com todas as letras
-   (seção 5), mas é uma **decisão sua**: se a exclusão deve apagar também a análise (o que um pedido de eliminação
-   da LGPD sugere), é uma mudança de comportamento que não fiz sem você decidir.
-3. **Não existe exclusão de conta** nem exportação dos dados pelo próprio usuário: os direitos da LGPD ficam por
-   pedido ao e-mail de contato.
+   (incluindo a resposta bruta da IA, `raw_response`) continua no banco. **Decisão: manter assim.** O termo diz isso com
+   todas as letras (seção 5).
+3. **Não existe exclusão de conta** nem exportação dos dados pelo próprio usuário. **Decisão: não é necessário.** Se um
+   pedido de eliminação surgir, é um script de SQL feito pelo operador (ver "Eliminar uma conta", abaixo).
 4. O termo só aparecia **depois** do cadastro. Agora há a página pública `/privacidade` e o link na tela de cadastro.
 
 **Mudanças:**
@@ -954,8 +953,8 @@ o que depende de conta em provedor, de domínio ou de advogado **não foi feito*
 - **Versão do termo 1.0.0 → 1.1.0** (`TERMS_CURRENT_VERSION` e `NEXT_PUBLIC_TERMS_VERSION`, que precisam ser iguais). Como
   o texto mudou de verdade, **todo usuário existente precisará aceitar de novo** (é como o guard de termos funciona).
   Os scripts de teste que gravam usuários direto no banco passaram a usar a versão vigente.
-- Variáveis `NEXT_PUBLIC_CONTROLLER_NAME` e `NEXT_PUBLIC_PRIVACY_EMAIL` (frontend, lidas no **build**): enquanto vazias, o
-  texto mostra um aviso amarelo no lugar dos dados do responsável. **Preencha antes de publicar.**
+- Variáveis opcionais `NEXT_PUBLIC_CONTROLLER_NAME` e `NEXT_PUBLIC_PRIVACY_EMAIL` (frontend, lidas no **build**): quando
+  preenchidas, o termo mostra o responsável e o e-mail de contato; vazias, ele usa um texto genérico (ver "Para uso comercial").
 - `OPENROUTER_DATA_COLLECTION` (backend) e `GET /api/privacy-info` (público), com avisos no boot de produção (`production-checks.ts`: 18 → 23 verificações testadas). O termo lê esse endpoint.
 - O build de produção do frontend (`npm run build`) passa, as páginas estáticas incluem `/privacidade`.
 
@@ -984,16 +983,28 @@ docker compose run --rm --no-deps -T -e NODE_PATH=/app/node_modules -e USERS=8 -
   -v "$PWD/backend/scripts:/t:ro" -v "$PWD/backend/test-fixtures:/fx:ro" backend node /t/test-load-light.js
 ```
 
-**Pendente (depende de você, de provedores ou de advogado):**
+**Eliminar uma conta (script do operador).** Não há botão no produto; se for preciso, rode no SQL Editor do Supabase,
+trocando o e-mail. A ordem importa: os arquivos ainda não expirados (retenção de 72 h) ficam órfãos no bucket se a
+linha de `documents` sumir antes, então **espere as 72 h ou apague os arquivos antes** (painel do Storage ou API).
+`refresh_tokens`, `documents` e `analyses` saem em cascata; `audit_logs` guardaria o IP sem dono (`on delete set null`),
+por isso é apagado antes:
 
-- Revisão **jurídica** do texto do termo (o texto é fiel ao código, mas não é parecer) e preencher
-  `NEXT_PUBLIC_CONTROLLER_NAME` / `NEXT_PUBLIC_PRIVACY_EMAIL`.
-- Decidir a exclusão da análise junto com o documento e se haverá exclusão de conta (achados 2 e 3).
-- Confirmar com o advogado o aviso de que o provedor gratuito pode treinar com o conteúdo (o termo já mostra isso enquanto `allow`), ou trocar para modelo **pago** + `deny` quando quiser. Com o modelo gratuito, o limite diário da OpenRouter faz as análises terminarem em erro até o dia seguinte.
-- Deploy: Redis gerenciado, VM, domínio, certificado HTTPS, frontend e API **sob o mesmo domínio raiz** (cookie
-  `SameSite=strict`), `HEALTH_URL` e webhook no GitHub, plano pago do Supabase, par de chaves JWT novo.
-  O critério de pronto da spec ("acessível publicamente, com HTTPS, funcionando de ponta a ponta para um usuário
-  externo") **só pode ser verificado depois disso**.
+```sql
+delete from audit_logs where user_id = (select id from users where email = 'fulano@exemplo.com');
+delete from users where email = 'fulano@exemplo.com';
+```
+
+**Para uso comercial (com usuários reais)** seria necessário, além do que está pronto: revisão **jurídica** do Termo de
+Uso e da Política de Privacidade (o texto é fiel ao código, mas não é parecer); preencher
+`NEXT_PUBLIC_CONTROLLER_NAME` e `NEXT_PUBLIC_PRIVACY_EMAIL` (hoje o termo usa um texto genérico no lugar do responsável e
+do canal de contato); reavaliar o uso de modelo gratuito de IA (o provedor pode treinar com o conteúdo, e o termo avisa
+isso) em favor de um modelo pago com `OPENROUTER_DATA_COLLECTION=deny`; e decidir se o usuário passa a poder excluir a
+conta e a análise por conta própria.
+
+**Pendente para colocar no ar** (depende de provedores): Redis gerenciado, VM, domínio, HTTPS, frontend e API **sob o
+mesmo domínio raiz** (cookie `SameSite=strict`), `HEALTH_URL` e webhook, par de chaves JWT novo. O critério de pronto da
+spec ("acessível publicamente, com HTTPS, funcionando de ponta a ponta para um usuário externo") **só pode ser
+verificado depois disso**. Passo a passo em "Deploy gratuito".
 
 ---
 
@@ -1601,6 +1612,111 @@ gerenciado, não um container.
 6. **Ligar o monitor externo:** definir `ALERT_WEBHOOK_URL` no `.env.production` e, no GitHub, a variável
    `HEALTH_URL` e o secret `ALERT_WEBHOOK_URL` (ver "Monitoramento e alertas"). Testar uma vez parando
    o Redis (ou apontando `HEALTH_URL` para um endereço errado) para ver o aviso chegar.
+
+### Deploy gratuito — passo a passo (NÃO feito)
+
+Caminho pensado para custar quase nada e ser simples. **Os planos gratuitos mudam sem aviso (conferi em out/2026,
+em fontes de terceiros e nos sites dos provedores): confirme cada limite na página oficial antes de contar com ele.**
+É uma versão enxuta do desenho do diagrama: **1 VM** com o Cloudflare na frente em vez de um balanceador pago.
+O compose é o mesmo (`docker-compose.prod.yml`), então crescer depois (mais VMs, balanceador pago) não exige mudar código.
+
+| Peça | Provedor (gratuito) | Limite que importa |
+|---|---|---|
+| Frontend | **Vercel** (Hobby) | Só **uso não comercial** (cobrar usuários, anúncios ou hospedar para terceiros exige o plano pago) |
+| Backend | **Google Cloud e2-micro** (Always Free) | 1 VM com 1 GB de RAM, 30 GB de disco, 1 GB de saída de rede por mês, só nas regiões `us-west1`, `us-central1` ou `us-east1`. **Só dá para 1 réplica.** O IP externo da VM pode ser cobrado (alguns dólares por mês; confira no faturamento) |
+| HTTPS e "balanceador" | **Cloudflare** (Free) + **Cloudflare Tunnel** | Precisa de um **domínio próprio**. Upload de até 100 MB e 100 s por requisição (usamos 20 MB) |
+| Redis | **Redis Cloud** (Free) | 30 MB, **30 conexões**, 100 operações/s, sem réplica nem failover. Cada réplica do backend abre ~10 conexões (estimativa pelo código: 4 filas, 3 workers com 2 conexões cada e o cliente compartilhado), então no máximo **2 réplicas** |
+| Banco e arquivos | **Supabase** (Free) | 500 MB de banco, 1 GB de arquivos. **Pausa após 1 semana sem atividade**; o monitor abaixo consulta o banco a cada poucos minutos, o que deve evitar a pausa (confirme) |
+| IA | **OpenRouter** (modelo `:free`) | Limite diário (as análises terminam em erro quando acaba) e o provedor pode treinar com o conteúdo (o Termo de Uso já avisa) |
+| Monitor | **UptimeRobot** (Free) ou o workflow do GitHub | O workflow do GitHub é grátis em repositório público; em privado o limite de minutos do Actions pode acabar |
+| Domínio | Cloudflare Registrar ou Registro.br | **Único custo certo: ~US$ 10 por ano** |
+
+Por que não os outros: o **Render** gratuito dorme após 15 minutos sem tráfego, o que mata os workers da fila, a varredura
+e os alertas (que rodam dentro do processo); o **Oracle Always Free** teve cortes em 2026 e é comum faltar capacidade.
+Por que o **Tunnel** e não o proxy comum do Cloudflare: o proxy comum chega à VM por HTTP puro pela internet (os tokens
+de login passariam sem criptografia nesse trecho) ou exige certificado na VM. O Tunnel abre uma conexão criptografada
+**de saída** da VM até o Cloudflare e nenhuma porta fica exposta.
+
+**1. Local, antes de tudo.** Gere um par novo de chaves JWT (seção 2). Preencha `backend/.env.production` a partir do
+`.env.production.example`: `FRONTEND_URL=https://app.seudominio.com`, `OPENROUTER_MODEL` com um modelo `:free`,
+`OPENROUTER_DATA_COLLECTION=allow`, as chaves do Supabase e as JWT. O `REDIS_URL` vem do passo 3.
+
+**2. Supabase.** Confira se as migrations `001` a `004` rodaram e se o bucket `documents` está **privado**.
+
+**3. Redis Cloud.** Crie o banco gratuito e copie endereço, porta e senha para o formato
+`rediss://default:SENHA@HOST:PORTA` (TLS; se a conexão falhar, use `redis://` e confira no painel se o TLS está ligado).
+No painel, confirme que a política de memória é **`noeviction`** (o BullMQ exige e avisa no boot se não for).
+Depois do primeiro boot, confira `CLIENT LIST`: se passar de ~25 conexões, use 1 réplica.
+
+**4. Domínio e Cloudflare.** Registre o domínio e coloque o DNS dele no Cloudflare (Free).
+
+**5. Túnel.** No painel (Zero Trust → Networks → Tunnels) crie um túnel, copie o **token** e cadastre um hostname
+público `api.seudominio.com` apontando para `http://nginx:80`.
+
+**6. VM no Google Cloud.** Crie uma VM **e2-micro** em `us-central1` (Ubuntu ou Debian). Não precisa abrir nenhuma
+porta de entrada (o tráfego chega pelo túnel). Na VM, instale o Docker e crie 2 GB de swap, porque 1 GB de RAM é pouco
+para compilar a imagem:
+
+```bash
+curl -fsSL https://get.docker.com | sudo sh
+```
+
+```bash
+sudo fallocate -l 2G /swapfile && sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile
+```
+
+Clone o repositório, copie o `backend/.env.production` para a VM e crie, na raiz, um `.env` (ignorado pelo git) com:
+
+```bash
+LB_TRUSTED_CIDRS=172.16.0.0/12
+BACKEND_REPLICAS=1
+CLOUDFLARE_TUNNEL_TOKEN=cole-o-token-aqui
+```
+
+Suba (o build leva alguns minutos nessa máquina):
+
+```bash
+docker compose -f docker-compose.prod.yml --profile tunnel up -d --build
+```
+
+Veja os logs do backend: a validação de produção lista erros e avisos (os avisos de modelo `:free` e de treino são
+esperados neste caminho).
+
+**7. Frontend na Vercel.** Importe o repositório com **Root Directory = `frontend`**. Variáveis:
+`NEXT_PUBLIC_API_URL=https://api.seudominio.com` e `NEXT_PUBLIC_TERMS_VERSION=1.1.0` (as `NEXT_PUBLIC_CONTROLLER_NAME` e
+`NEXT_PUBLIC_PRIVACY_EMAIL` são opcionais). Associe `app.seudominio.com` e crie no Cloudflare o registro que a Vercel indicar
+(como **DNS only**, nuvem cinza). As variáveis `NEXT_PUBLIC_*` são lidas no build: mudou, rebuilda.
+
+**8. Monitor e alertas.** Crie um webhook gratuito (por exemplo, de um canal do Discord) e ponha em `ALERT_WEBHOOK_URL`
+(com `ALERT_WEBHOOK_FORMAT=discord`) no `.env.production`. No UptimeRobot, monitore
+`https://api.seudominio.com/api/health/ready` a cada 5 minutos, esperando `200`. (Alternativa: o workflow
+`.github/workflows/uptime.yml`, com a variável `HEALTH_URL` e o secret `ALERT_WEBHOOK_URL`.)
+
+**9. Teste final**, num navegador de verdade: cadastro, aceite do termo, upload, resultado, recarregar a página
+(o login precisa se manter) e conferir em `audit_logs.ip_address` se aparece o IP real, não o do Cloudflare.
+
+**O que isso NÃO tem (limites assumidos):** só 1 VM, então a queda dela derruba o app (o monitor avisa); 1 ou 2
+réplicas; Redis sem failover (se cair, o rate limit fica por réplica e a fila pausa, ver "O que acontece se o Redis
+cair"); e a IA gratuita com limite diário.
+
+**Crescer depois (o código e os arquivos já estão preparados; é troca de recurso e de variável, não de código):**
+
+| Quando | O que fazer | Onde |
+|---|---|---|
+| Mais vazão na mesma VM | VM maior e `BACKEND_REPLICAS` maior | `.env` da raiz; cada réplica usa ~10 conexões no Redis: confira o limite do plano |
+| Sobreviver à queda de uma VM | 2 ou mais VMs com o mesmo compose e um **balanceador do provedor** na frente (health check em `/api/health`, firewall, `LB_TRUSTED_CIDRS` com as faixas dele, sem o túnel) | "Várias VMs atrás de um load balancer" |
+| Redis sem falhas | Plano pago com réplica/failover, TLS e `noeviction` | só o `REDIS_URL` |
+| Banco sem pausa e com mais espaço | Supabase Pro | painel do Supabase |
+| Privacidade e sem limite diário | Modelo de IA pago com `OPENROUTER_DATA_COLLECTION=deny` e **nova versão do termo** (todos aceitam de novo) | `.env.production`, `TERMS_CURRENT_VERSION` e `NEXT_PUBLIC_TERMS_VERSION` |
+
+Limites que o código ainda tem e que só mudam com trabalho novo: **Redis Cluster não é suportado** (hoje só instância
+única, com ou sem réplica); a concorrência do worker é fixa em 2 por réplica; `audit_logs` não tem retenção; e o polling
+do frontend ainda faz 1 a 2 leituras por consulta (ver "Carga no banco"). Nada disso foi testado com carga real.
+
+**Não verificado** (só dá para provar na prática): o Tunnel entregando o IP do cliente ao Nginx (`LB_TRUSTED_CIDRS` com a
+faixa do Docker; vale conferir no passo 9), o `cloudflared` em execução, o Redis Cloud com este backend (TLS, política de
+memória, contagem de conexões), o cookie `secure` e o login se mantendo por HTTPS, e se o tráfego do monitor evita a
+pausa do Supabase.
 
 ---
 

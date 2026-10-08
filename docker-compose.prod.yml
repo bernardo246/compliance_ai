@@ -73,3 +73,22 @@ services:
       interval: 15s
       timeout: 3s
       retries: 5
+
+  # OPCIONAL — Cloudflare Tunnel (plano gratuito do Cloudflare como "balanceador" externo, com 1 VM).
+  # A VM abre uma conexão CRIPTOGRAFADA de saída até o Cloudflare e o tráfego chega por ela: nenhuma porta
+  # precisa ficar aberta na internet e o trecho Cloudflare → VM não passa em HTTP puro. Só sobe com
+  # `--profile tunnel`. No painel do Cloudflare (Zero Trust → Networks → Tunnels) crie o túnel, aponte o
+  # hostname público (ex.: api.seudominio.com) para http://nginx:80 e coloque o token em CLOUDFLARE_TUNNEL_TOKEN.
+  # O Nginx recebe a conexão do container do túnel (rede interna do Docker): use
+  # LB_TRUSTED_CIDRS=172.16.0.0/12 (faixa das redes do Docker) para ele confiar no IP do cliente que o
+  # Cloudflare informa. Passo a passo no README, "Deploy gratuito".
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    profiles: ["tunnel"]
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:-}
+    depends_on:
+      nginx:
+        condition: service_healthy
