@@ -1,4 +1,7 @@
-export const API_URL = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:3001';
+// "same-origin" = chamadas relativas (/api/...) ao próprio endereço do frontend; combinar com BACKEND_URL
+// no next.config.ts, que repassa /api/* ao backend. Fora isso, o endereço completo da API.
+const rawApiUrl = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:3001';
+export const API_URL = rawApiUrl === 'same-origin' ? '' : rawApiUrl.replace(/\/$/, '');
 
 // access token vive só em memória (não em localStorage) — mitiga XSS.
 // O refresh token vive em cookie httpOnly, setado pelo backend.

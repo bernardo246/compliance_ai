@@ -1624,6 +1624,40 @@ gerenciado, não um container.
    `HEALTH_URL` e o secret `ALERT_WEBHOOK_URL` (ver "Monitoramento e alertas"). Testar uma vez parando
    o Redis (ou apontando `HEALTH_URL` para um endereço errado) para ver o aviso chegar.
 
+### Validar em nuvem sem domínio (teste, NÃO feito)
+
+Para ver o app funcionando em nuvem **sem domínio próprio e sem conta no Cloudflare**, a Vercel faz o papel de
+proxy: o navegador fala só com `https://seu-app.vercel.app`, e o Next repassa `/api/*` ao backend (`rewrites` em
+`frontend/next.config.ts`, ligado por `BACKEND_URL`). Assim o cookie do refresh token (`SameSite=strict`) é de primeira
+parte e o login se mantém. O backend é exposto por um **túnel rápido do Cloudflare** (`https://xxxx.trycloudflare.com`,
+sem conta, endereço aleatório que **muda a cada reinício**, sem garantia de disponibilidade: só para teste).
+
+Variáveis do frontend na Vercel (lidas no **build**; mudou o endereço do backend, faça um novo deploy):
+
+| Variável | Valor |
+|---|---|
+| `NEXT_PUBLIC_API_URL` | `same-origin` (chamadas relativas ao próprio endereço do frontend) |
+| `BACKEND_URL` | `https://xxxx.trycloudflare.com` (o endereço do túnel) |
+| `NEXT_PUBLIC_TERMS_VERSION` | `1.1.0` |
+
+Duas etapas, da mais simples para a mais completa:
+
+1. **Só Vercel + o seu computador (nenhuma conta nova).** Suba o ambiente local (`docker compose up -d --build`) e exponha a
+   porta 8080 com
+   `docker run --rm cloudflare/cloudflared:latest tunnel --no-autoupdate --url http://host.docker.internal:8080`
+   (o endereço aparece na saída). Valida o frontend na Vercel, o HTTPS, o repasse e o login se mantendo. **Não valida** o
+   `secure` do cookie em produção (o backend local roda com `NODE_ENV=development`), nem Redis gerenciado, nem VM.
+2. **Backend em uma VM com Redis gerenciado** (contas no Redis Cloud e no Google Cloud): o passo a passo de "Deploy
+   gratuito", trocando o túnel nomeado pelo rápido (`docker compose -f docker-compose.prod.yml --profile quicktunnel up -d --build`
+   e `docker compose -f docker-compose.prod.yml logs cloudflared-quick` para ler o endereço) e sem domínio nem Cloudflare.
+   Valida o `NODE_ENV=production`, o Redis gerenciado e a VM.
+
+Limites deste caminho: todas as requisições chegam ao backend pela Vercel, então o rate limit pode enxergar o IP da
+Vercel e **juntar todos os usuários em um só** (login limitado a 5 por minuto no total); confira em `audit_logs.ip_address`.
+O repasse da Vercel pode ter limite de tamanho de corpo em uploads grandes (os PDFs de teste têm ~2 KB). Verificado
+localmente com um backend de mentira: `GET`, `POST` com corpo, `Set-Cookie` na volta e cookie reenviado atravessam o
+repasse; **não** foi testado na Vercel de verdade.
+
 ### Deploy gratuito — passo a passo (NÃO feito)
 
 Caminho pensado para custar quase nada e ser simples. **Os planos gratuitos mudam sem aviso (conferi em out/2026,

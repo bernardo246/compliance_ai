@@ -92,3 +92,17 @@ services:
     depends_on:
       nginx:
         condition: service_healthy
+
+  # OPCIONAL — túnel RÁPIDO do Cloudflare (sem conta e sem domínio): gera um endereço aleatório
+  # https://xxxx.trycloudflare.com que muda a cada reinício. Só para TESTAR em nuvem (o Cloudflare não
+  # dá garantia de disponibilidade). Suba com `--profile quicktunnel`, leia o endereço nos logs
+  # (`docker compose -f docker-compose.prod.yml logs cloudflared-quick`) e use como BACKEND_URL do frontend.
+  # Também use LB_TRUSTED_CIDRS=172.16.0.0/12 (faixa das redes do Docker).
+  cloudflared-quick:
+    image: cloudflare/cloudflared:latest
+    profiles: ["quicktunnel"]
+    restart: unless-stopped
+    command: tunnel --no-autoupdate --url http://nginx:80
+    depends_on:
+      nginx:
+        condition: service_healthy
