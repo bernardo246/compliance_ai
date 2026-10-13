@@ -84,7 +84,7 @@ projeto-analise-ia/
 │   ├── scripts/           # golden set (F4/F9) + pipeline (F5) + retenção (F7) + malware/segurança (F8)
 │   │                      # + testes de escalabilidade: queue-race, double-stall, e2e-http, load-balancer
 │   ├── test-fixtures/     # 12 PDFs de teste (2 por área) com problemas conhecidos injetados
-│   └── sql/               # 001_init + 002_analysis_pipeline + 003_retention + 004_scale_indexes.sql (rodar no Supabase, em ordem)
+│   └── sql/               # 001_init … 005_data_retention_indexes.sql (rodar no Supabase, em ordem)
 ├── nginx/nginx.conf        # Escalabilidade — load balancer na frente das réplicas (local, HTTP)
 ├── nginx/nginx.prod.conf   # Produção — Nginx de cada VM, atrás do load balancer do provedor (só HTTP)
 ├── nginx/lb-trusted-proxies.sh  # Gera as faixas de IP do balanceador em quem o Nginx confia (LB_TRUSTED_CIDRS)
@@ -136,8 +136,9 @@ projeto-analise-ia/
    Fase 5: `analyses.checklist`, `analyses.status_compliance_geral`,
    `documents.processing_started_at`, `documents.erro`, etc.), e depois com
    `backend/sql/003_retention.sql` (índice usado pela varredura da Fase 7) e
-   `backend/sql/004_scale_indexes.sql` (índices da limpeza de refresh tokens e dos alertas).
-   Rodar **na ordem** (001 → 002 → 003 → 004). Todas são idempotentes
+   `backend/sql/004_scale_indexes.sql` (índices da limpeza de refresh tokens e dos alertas) e
+   `backend/sql/005_data_retention_indexes.sql` (índices da retenção de `audit_logs` e `raw_response`).
+   Rodar **na ordem** (001 → 002 → 003 → 004 → 005). Todas são idempotentes
    (`if not exists`), então rodar de novo não quebra nada.
 
 ### 1.3. Criar o bucket de Storage
@@ -336,9 +337,9 @@ Ao final imprime a linha de `analyses` gravada e **limpa tudo que criou**
 - `AnalysisQueueService` (`src/analysis/analysis-queue.service.ts`) coloca o job
   numa fila **BullMQ no Redis**, com `jobId = documentId` (um job por documento
   por vez). `AnalysisProcessor` (`src/analysis/analysis.processor.ts`) é o
-  worker, com concorrência **fixa em 2 por réplica** (o decorator `@Processor`
-  é avaliado antes do `.env` carregar, então não dá para ler de config; a
-  variável `ANALYSIS_CONCURRENCY` ficou sem efeito). Cada job: baixa o arquivo
+  worker, com concorrência de **5 por réplica** por padrão (`ANALYSIS_CONCURRENCY`; o decorator
+  `@Processor` só traz o padrão e o valor configurado é aplicado ao worker em `onApplicationBootstrap`).
+  Cada job: baixa o arquivo
   do Storage → `AnalysisService.analyze()` → `upsert` em `analyses`
   (idempotente, `unique(document_id)`) → `status = 'done'`. Qualquer erro no
   caminho vira `status = 'error'` + `documents.erro` com a mensagem.
@@ -972,7 +973,7 @@ Supabase e OpenRouter reais, 201 s no total:
 | Do upload ao resultado final | p50 106 s · p95 182 s |
 | Resultado | 15 `done`, 1 `error` (a IA devolveu um checklist fora do schema, o ~1 em 10 já conhecido), 0 presos |
 
-Como ler: **não é um teste de capacidade.** O gargalo do fluxo é a IA, não a API: são 6 análises simultâneas (2 por réplica) e
+Como ler: **não é um teste de capacidade.** O gargalo do fluxo é a IA, não a API: eram 6 análises simultâneas (2 por réplica, o padrão da época; hoje é 5) e
 cada uma leva dezenas de segundos, então 16 documentos levam ~3 min até o último resultado. A API em si (upload, leitura,
 lista, prontidão) respondeu em menos de 1,7 s no pior caso. As latências incluem a ida e volta até o Supabase na nuvem. Não
 testei mais usuários que isso, nem arquivos grandes (os de teste têm ~2 KB), nem com modelo pago.
@@ -998,8 +999,9 @@ delete from users where email = 'fulano@exemplo.com';
 Uso e da Política de Privacidade (o texto é fiel ao código, mas não é parecer); preencher
 `NEXT_PUBLIC_CONTROLLER_NAME` e `NEXT_PUBLIC_PRIVACY_EMAIL` (hoje o termo usa um texto genérico no lugar do responsável e
 do canal de contato); reavaliar o uso de modelo gratuito de IA (o provedor pode treinar com o conteúdo, e o termo avisa
-isso) em favor de um modelo pago com `OPENROUTER_DATA_COLLECTION=deny`; e decidir se o usuário passa a poder excluir a
-conta e a análise por conta própria.
+isso) em favor de um modelo pago com `OPENROUTER_DATA_COLLECTION=deny`; revisar o prazo de retenção dos registros de
+auditoria (`AUDIT_LOG_RETENTION_DAYS`, padrão 90), que algumas normas exigem manter por mais tempo; e decidir se o usuário
+passa a poder excluir a conta e a análise por conta própria.
 
 **Pendente para colocar no ar** (depende de provedores): Redis gerenciado, VM, domínio, HTTPS, frontend e API **sob o
 mesmo domínio raiz** (cookie `SameSite=strict`), `HEALTH_URL` e webhook, par de chaves JWT novo. O critério de pronto da
@@ -1086,7 +1088,9 @@ docker compose down -v              # derruba tudo
 | `OPENROUTER_DATA_COLLECTION` | `deny` (padrão): a OpenRouter só usa provedores que não guardam nem treinam com o conteúdo. `allow`: necessário para modelos `:free`; o provedor pode treinar com o conteúdo e o Termo de Uso avisa isso sozinho (`GET /api/privacy-info`). Em produção `allow` sobe com aviso |
 | `NEXT_PUBLIC_CONTROLLER_NAME`, `NEXT_PUBLIC_PRIVACY_EMAIL` | (frontend, lidas no build) Responsável pelos dados e contato de privacidade exibidos no Termo de Uso |
 | `REFRESH_REVOKED_RETENTION_MS` | Quanto tempo um refresh token já usado fica no banco antes de o job de retenção apagá-lo (padrão 3600000 = 1 h, mínimo 1 min) |
-| `ANALYSIS_CONCURRENCY` | **Sem efeito hoje**: a concorrência do worker é fixa em 2 por réplica (o decorator é avaliado antes do `.env` carregar) |
+| `ANALYSIS_CONCURRENCY` | Quantas análises cada réplica processa ao mesmo tempo (padrão 5). O total é réplicas × este valor, limitado pelo que o provedor de IA aceita (o modelo gratuito tem limite de requisições) |
+| `AUDIT_LOG_RETENTION_DAYS` | Registros de auditoria mais antigos que isto são **apagados** pelo job de retenção, a cada hora (padrão 90, mínimo 1) |
+| `RAW_RESPONSE_RETENTION_DAYS` | A resposta bruta da IA (`analyses.raw_response`, ~9 KB por análise, só para depuração) é **zerada** depois disto; o resultado da análise continua (padrão 30, mínimo 1) |
 | `ANALYSIS_STUCK_TIMEOUT_MS` | Idade a partir da qual um documento em `processing` é reenfileirado (no boot e na varredura periódica) |
 | `ANALYSIS_RECOVERY_INTERVAL_MS` | Intervalo da varredura periódica de documentos parados (padrão 300000 = 5 min) |
 
@@ -1217,9 +1221,9 @@ ler menos e não deixar tabelas crescerem sem limite. Auditoria do código, e o 
 | Varredura de documentos parados e retenção de 72h | Já usam índices (`idx_documents_pendentes`, `idx_documents_retencao`) | Sem mudança |
 
 **O que continua pesando** (não resolvido):
-- Cada consulta de polling ainda faz 1 a 2 leituras (o documento e, na tela de detalhe, a análise). Com
-  muitos usuários esperando ao mesmo tempo isso continua sendo a maior fonte de leitura. A saída seria um
-  cache curto do status ou notificação por servidor (SSE/WebSocket), que não foi feita.
+- Cada consulta de polling faz **1 leitura** enquanto o documento está em análise (a análise só é lida quando o
+  status é `done`; antes eram 2). Com muitos usuários esperando ao mesmo tempo continua sendo a maior fonte de
+  leitura. A saída seria um cache curto do status ou notificação por servidor (SSE/WebSocket), que não foi feita.
 - `refresh_tokens` ainda guarda uma linha por renovação por 1 a 2 horas (até ~10 por usuário ativo com a
   sessão renovada a cada 15 min). Guardar uma linha por renovação **não é necessário**: o desenho mínimo é
   uma linha por sessão, atualizada no lugar (hash atual e hash anterior; o `UPDATE ... WHERE hash = ...`
@@ -1230,7 +1234,10 @@ ler menos e não deixar tabelas crescerem sem limite. Auditoria do código, e o 
   um refresh token revogado há mais de ~1 h deixa de derrubar a sessão inteira (ele continua sendo recusado
   com 401, só não aciona a revogação da família nem o log `refresh_token_reuse_detected`). Se preferir
   detectar por mais tempo, aumente `REFRESH_REVOKED_RETENTION_MS`.
-- `audit_logs` só cresce (login, upload, exclusão); não há retenção.
+- **Crescimento de dados:** `audit_logs` (~150 bytes por linha) é apagado depois de `AUDIT_LOG_RETENTION_DAYS` e
+  `analyses.raw_response` (a maior parte das ~17 KB de cada análise, medido no banco real) é zerado depois de
+  `RAW_RESPONSE_RETENTION_DAYS`, ambos pelo job de retenção horário. O que continua crescendo é o resultado de
+  cada análise (~8 KB), então o limite de 500 MB do Supabase gratuito fica em ~60 mil análises.
 - Nada disso foi testado com carga real: os números acima são contas sobre o código e medidas pontuais.
 
 ### O que acontece se o Redis cair
@@ -1366,6 +1373,8 @@ entre elas e o limite de login vale somado.
 | `backend/scripts/test-redis-down-live.js` | **Ao vivo**: derruba o Redis com 3 réplicas no ar e testa login, `/api/health`, `/api/health/ready`, rotas autenticadas e o rate limit | 8 de 8: com o Redis parado, o login responde `401` em ~1 s (antes travava), `/api/health` responde `200` em ~10 ms, `/api/health/ready` responde `503`, uma rota autenticada responde `200` (o cache de termos cai para o banco) e o rate limit continua valendo por réplica (429 na 10ª tentativa com 3 réplicas); com o Redis de volta, tudo normaliza e o contador volta a ser gravado nele |
 | `backend/scripts/test-uptime-check.js` (`npm run uptime:test`; com `LIVE=1` também contra o app real) | Monitor externo: servidor de saúde falso (200, 503, travado, porta fechada) e receptor de webhook; com `LIVE=1`, o `/api/health/ready` real com o Redis parado e religado | 13 de 13 offline; 16 de 16 com `LIVE=1`: um aviso por queda (sem repetir), "resolvido" na volta, oscilação de 2 falhas não alerta, travado estoura o timeout e não pendura, webhook fora não quebra |
 | `backend/scripts/test-load-light.js` | **Ao vivo, dentro do Compose** (Supabase e OpenRouter reais, 3 réplicas): 8 usuários × 2 documentos com IP próprio; mede latência de upload/leitura/lista/prontidão e tempo até o resultado | 7 de 7: 0 erros 5xx, 0 presos, upload p95 1,7 s, leitura p95 0,7 s; 15 `done` + 1 `error` (schema da IA). Ver Fase 10 |
+| `backend/scripts/test-data-retention.ts` (`npm run data-retention:test`) | **Offline**: retenção de `audit_logs` e de `raw_response` (prazos, lotes, erros do banco, valores absurdos), concorrência do worker aplicada da configuração e o polling lendo a análise só no `done` | 19 de 19 verificações passaram |
+| `backend/scripts/test-data-retention-live.ts` | **Ao vivo** (Supabase real, sem Docker): grava linhas com `created_at` controlado e roda a retenção de verdade | 5 de 5: auditoria de 91 a 100 dias apagada e a de 89 e 1 dia preservada; `raw_response` de 31 e 40 dias zerado e o de 29 e 5 dias preservado; nenhuma análise apagada |
 | `backend/scripts/test-e2e-http.js` | Pela API HTTP: cadastro, termos, login, 8 uploads simultâneos, leitura do resultado — sempre alternando réplicas | Tudo passou; 8 documentos, cada um processado 1× |
 | `backend/scripts/test-load-balancer.js` | Nginx: distribuição, contador, IP real e header forjado, upload grande, **dois dispositivos na mesma conta**, rate limit global, réplica morta, escala para 5 réplicas | 15 de 15 verificações passaram (distribuição 56/49/45; 0 falhas em 60 requisições com uma réplica morta; 5 réplicas usadas sem reiniciar o Nginx) |
 | Carga na camada da fila (3.000 jobs, 30.000 enqueues, 3 workers em containers separados) | O comportamento do BullMQ sob volume | 3.000 execuções exatas com a fila pausada na rajada; 286 duplicados sem pausar (ver Etapa 4). **O script não ficou no repositório** |
@@ -1387,6 +1396,8 @@ npm run multi-tab:test                                                # offline,
 npm run alerts:test                                                   # offline, não precisa de Docker
 npm run throttler-resilient:test                                      # offline, não precisa de Docker
 npm run uptime:test                                                   # offline (LIVE=1 também contra o Compose de teste)
+npm run data-retention:test                                           # offline, não precisa de Docker
+npx ts-node scripts/test-data-retention-live.ts                       # ao vivo (Supabase real), sem Docker
 node backend/scripts/test-register-race.js                            # ao vivo; precisa do Nginx em :8080
 node backend/scripts/test-alerts-live.js                              # ao vivo; precisa do Compose de teste (webhook em :9099)
 node backend/scripts/test-redis-down-live.js                          # ao vivo; derruba e religa o Redis do Compose
@@ -1418,7 +1429,7 @@ rodar: confira o Supabase por usuários `race-test+`, `stall-test+`, `sweep-test
 - A varredura reanalisa um documento parado do zero (chama a IA de novo). Se a
   análise já tinha sido gravada em `analyses` e só a gravação do `done` falhou,
   essa chamada é desperdiçada (o `upsert` mantém o resultado único).
-- Concorrência do worker fixa em 2 por réplica.
+- Concorrência do worker: 5 por réplica por padrão (`ANALYSIS_CONCURRENCY`).
 - O volume de milhares de jobs foi testado só na camada da fila; o processador
   real com Supabase foi testado até 20 documentos (o OpenRouter gratuito não
   aguenta mais que isso). Queda de réplica testada com 1 e com 2 mortes
@@ -1710,8 +1721,9 @@ cair"); e a IA gratuita com limite diário.
 | Privacidade e sem limite diário | Modelo de IA pago com `OPENROUTER_DATA_COLLECTION=deny` e **nova versão do termo** (todos aceitam de novo) | `.env.production`, `TERMS_CURRENT_VERSION` e `NEXT_PUBLIC_TERMS_VERSION` |
 
 Limites que o código ainda tem e que só mudam com trabalho novo: **Redis Cluster não é suportado** (hoje só instância
-única, com ou sem réplica); a concorrência do worker é fixa em 2 por réplica; `audit_logs` não tem retenção; e o polling
-do frontend ainda faz 1 a 2 leituras por consulta (ver "Carga no banco"). Nada disso foi testado com carga real.
+única, com ou sem réplica) e o polling do frontend ainda é por consulta periódica (1 leitura por consulta; a saída seria SSE
+ou WebSocket). Concorrência do worker, retenção de `audit_logs` e de `raw_response` já são configuráveis. Nada disso foi testado
+com carga real.
 
 **Não verificado** (só dá para provar na prática): o Tunnel entregando o IP do cliente ao Nginx (`LB_TRUSTED_CIDRS` com a
 faixa do Docker; vale conferir no passo 9), o `cloudflared` em execução, o Redis Cloud com este backend (TLS, política de

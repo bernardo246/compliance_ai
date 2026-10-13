@@ -169,8 +169,10 @@ export class DocumentsService {
     }
 
     // Fase 5: embute a análise (ou null) para o frontend consultar status +
-    // resultado numa chamada só, sem precisar de um segundo GET.
-    const analise = await this.analysisRead.findByDocument(documentId);
+    // resultado numa chamada só, sem precisar de um segundo GET. Só existe análise
+    // quando o status é 'done': nos demais (uploaded/processing/error) a segunda
+    // leitura seria sempre vazia, e é o polling de status que mais pesa no banco.
+    const analise = data.status === 'done' ? await this.analysisRead.findByDocument(documentId) : null;
     return { ...data, analise };
   }
 

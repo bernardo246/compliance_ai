@@ -1,4 +1,4 @@
-import { Inject, Logger } from '@nestjs/common';
+import { OnApplicationBootstrap, Inject, Logger } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { OnWorkerEvent, Processor, WorkerHost } from '@nestjs/bullmq';
 import { Job } from 'bullmq';
@@ -30,13 +30,16 @@ interface PendingDocument {
  * Fase 4 — worker da fila de análise. Cada réplica do backend roda um; o
  * Redis entrega cada job a exatamente um deles.
  *
- * Concorrência fixa em 2 (por réplica): o decorator é avaliado antes do
- * ConfigModule carregar o .env, então não dá pra ler de config aqui.
+ * Concorrência por réplica: o decorator é avaliado antes do ConfigModule carregar o
+ * .env, então ele só traz o padrão; o valor de ANALYSIS_CONCURRENCY é aplicado ao
+ * worker já criado, em onApplicationBootstrap().
  * Erros de análise são gravados em documents.status='error' (sem rethrow),
  * igual ao comportamento anterior — o OpenRouterClient já faz retry.
  */
-@Processor(ANALISES_QUEUE, { concurrency: 2 })
-export class AnalysisProcessor extends WorkerHost {
+export const ANALYSIS_DEFAULT_CONCURRENCY = 5;
+
+@Processor(ANALISES_QUEUE, { concurrency: ANALYSIS_DEFAULT_CONCURRENCY })
+export class AnalysisProcessor extends WorkerHost implements OnApplicationBootstrap {
   private readonly logger = new Logger(AnalysisProcessor.name);
 
   constructor(
@@ -47,6 +50,19 @@ export class AnalysisProcessor extends WorkerHost {
     @Inject(REDIS_CLIENT) private readonly redis: Redis,
   ) {
     super();
+  }
+
+  /**
+   * Aplica ANALYSIS_CONCURRENCY (quantas análises esta réplica processa ao mesmo tempo) ao worker do
+   * BullMQ. O limite real do sistema é a soma entre réplicas (réplicas × concorrência) e o que o provedor
+   * de IA aceita: o modelo gratuito tem limite de requisições, e acima dele o OpenRouterClient repete
+   * com espera.
+   */
+  onApplicationBootstrap(): void {
+    const configurada = Number(this.config.get<number>('analysis.concurrency'));
+    const valor = Number.isInteger(configurada) && configurada >= 1 ? configurada : ANALYSIS_DEFAULT_CONCURRENCY;
+    this.worker.concurrency = valor;
+    this.logger.log(`Concorrência do worker de análise: ${this.worker.concurrency} por réplica.`);
   }
 
   // Espera base entre tentativas de gravar no banco (3s, 6s...). Campo (e não

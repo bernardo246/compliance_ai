@@ -141,34 +141,75 @@ export class RetentionService implements OnModuleInit {
     return total;
   }
 
-  private async purgeRefreshTokenBatches(
+  private purgeRefreshTokenBatches(filtro: (q: any) => any): Promise<number> {
+    return this.purgeBatches('refresh_tokens', filtro, 'delete');
+  }
+
+  /**
+   * Apaga registros de auditoria mais antigos que `dataRetention.auditLogDays` (padrão 90). Sem isso a
+   * tabela só cresce (login, falha de login, upload, exclusão...). Em lotes: um acúmulo grande é drenado
+   * nas próximas execuções horárias.
+   */
+  async purgeOldAuditLogs(): Promise<number> {
+    const dias = this.config.get<number>('dataRetention.auditLogDays') ?? 90;
+    const limite = new Date(Date.now() - dias * 86_400_000).toISOString();
+    const apagados = await this.purgeBatches('audit_logs', (q) => q.lt('created_at', limite), 'delete');
+    if (apagados > 0) this.logger.log(`Registros de auditoria apagados: ${apagados} (mais antigos que ${dias} dias).`);
+    return apagados;
+  }
+
+  /**
+   * Zera `analyses.raw_response` (a resposta bruta da IA, só para depuração) das análises mais antigas que
+   * `dataRetention.rawResponseDays` (padrão 30). O resultado estruturado (resumo, checklist, sugestões)
+   * continua intacto. É a maior fatia do espaço de cada análise.
+   */
+  async purgeOldRawResponses(): Promise<number> {
+    const dias = this.config.get<number>('dataRetention.rawResponseDays') ?? 30;
+    const limite = new Date(Date.now() - dias * 86_400_000).toISOString();
+    const zerados = await this.purgeBatches(
+      'analyses',
+      (q) => q.lt('created_at', limite).not('raw_response', 'is', null),
+      'clear_raw_response',
+    );
+    if (zerados > 0) this.logger.log(`Respostas brutas da IA zeradas: ${zerados} (mais antigas que ${dias} dias).`);
+    return zerados;
+  }
+
+  /**
+   * Lotes de até 100 ids (a URL do DELETE/UPDATE leva os ids), até 50 lotes por passada. Um erro do banco
+   * interrompe a passada sem lançar: a próxima execução (1 h depois) continua de onde parou.
+   */
+  private async purgeBatches(
+    tabela: string,
     filtro: (q: any) => any,
+    acao: 'delete' | 'clear_raw_response',
   ): Promise<number> {
     const TAMANHO_LOTE = 100;
     const MAX_LOTES = 50;
-    let apagados = 0;
+    let afetados = 0;
 
     for (let lote = 0; lote < MAX_LOTES; lote++) {
-      const { data, error } = await filtro(this.db().from('refresh_tokens').select('id')).limit(TAMANHO_LOTE);
+      const { data, error } = await filtro(this.db().from(tabela).select('id')).limit(TAMANHO_LOTE);
 
       if (error) {
-        this.logger.error(`Falha ao listar refresh tokens para limpeza: ${error.message}`);
+        this.logger.error(`Falha ao listar ${tabela} para limpeza: ${error.message}`);
         break;
       }
       if (!data || data.length === 0) break;
 
-      const { error: deleteError } = await this.db()
-        .from('refresh_tokens')
-        .delete()
-        .in('id', data.map((t: { id: string }) => t.id));
+      const ids = data.map((t: { id: string }) => t.id);
+      const { error: writeError } =
+        acao === 'delete'
+          ? await this.db().from(tabela).delete().in('id', ids)
+          : await this.db().from(tabela).update({ raw_response: null }).in('id', ids);
 
-      if (deleteError) {
-        this.logger.error(`Falha ao apagar refresh tokens: ${deleteError.message}`);
+      if (writeError) {
+        this.logger.error(`Falha ao limpar ${tabela}: ${writeError.message}`);
         break;
       }
-      apagados += data.length;
+      afetados += data.length;
       if (data.length < TAMANHO_LOTE) break;
     }
-    return apagados;
+    return afetados;
   }
 }

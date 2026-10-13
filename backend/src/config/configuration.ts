@@ -57,6 +57,15 @@ export default () => ({
     ),
   },
 
+  // Retenção de dados que só crescem (job de retenção, a cada hora). `rawResponseDays`: depois disso o
+  // texto bruto da IA (analyses.raw_response, ~9 KB por análise, guardado só para depuração) é zerado e
+  // o resultado estruturado continua. `auditLogDays`: depois disso os registros de auditoria são apagados.
+  // Mínimo de 1 dia, para um valor errado (0, texto) não apagar tudo.
+  dataRetention: {
+    auditLogDays: Math.max(1, parseInt(process.env.AUDIT_LOG_RETENTION_DAYS ?? '90', 10) || 90),
+    rawResponseDays: Math.max(1, parseInt(process.env.RAW_RESPONSE_RETENTION_DAYS ?? '30', 10) || 30),
+  },
+
   terms: {
     currentVersion: process.env.TERMS_CURRENT_VERSION ?? '1.1.0',
   },
@@ -90,7 +99,7 @@ export default () => ({
     // Fase 5 — pipeline assíncrono in-process (sem Redis). Quantas análises
     // rodam em paralelo. Modelo grátis costuma ter rate limit apertado, então
     // 2 é um default conservador.
-    concurrency: parseInt(process.env.ANALYSIS_CONCURRENCY ?? '2', 10),
+    concurrency: parseInt(process.env.ANALYSIS_CONCURRENCY ?? '5', 10),
     // Um documento preso em 'processing' há mais que isto (ex.: o processo caiu
     // no meio de uma análise) é reenfileirado na próxima subida do backend.
     stuckTimeoutMs: parseInt(process.env.ANALYSIS_STUCK_TIMEOUT_MS ?? '600000', 10),
