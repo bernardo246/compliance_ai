@@ -1624,6 +1624,65 @@ gerenciado, não um container.
    `HEALTH_URL` e o secret `ALERT_WEBHOOK_URL` (ver "Monitoramento e alertas"). Testar uma vez parando
    o Redis (ou apontando `HEALTH_URL` para um endereço errado) para ver o aviso chegar.
 
+### Deploy direto na nuvem — Render + Vercel (sem VM, sem domínio e sem cartão)
+
+É o caminho mais curto para ver o app inteiro em nuvem: o backend e o Redis na **Render**, o frontend na **Vercel**.
+Tudo declarado em `render.yaml` (um clique) e o frontend fala com a API pelo endereço da Vercel (o repasse de
+`/api/*` descrito em "Validar em nuvem sem domínio"). Diferenças em relação ao caminho da VM: não há Nginx, túnel,
+Docker na máquina nem swap; o HTTPS e o endereço `https://....onrender.com` já vêm da Render; e o Redis fica na **rede
+privada** da Render (sem TLS e sem expor a senha na internet).
+
+| Peça | Onde | Limite que importa |
+|---|---|---|
+| Backend | Render, web service gratuito (Docker, `backend/Dockerfile`) | 512 MB de RAM e 0,1 CPU; **dorme após 15 min sem tráfego** (1 min para acordar); 750 h gratuitas por mês; sem cartão |
+| Redis | Render Key Value gratuito (`noeviction`, rede privada) | 25 MB, 50 conexões, **só em memória** (perde os dados ao reiniciar; a varredura periódica reenfileira o que ficou sem análise) |
+| Frontend | Vercel (Hobby) | Uso não comercial |
+| Banco e arquivos | Supabase (já existe) | Como antes |
+
+**Passo a passo**
+
+1. **Chaves JWT novas** (fora do repositório; apague os arquivos depois). Gere o par e converta a chave privada para
+   uma linha com `\n` literais, que é o formato que o backend lê:
+
+   ```bash
+   openssl genpkey -algorithm RSA -out /tmp/jwt-private.pem -pkeyopt rsa_keygen_bits:2048 && openssl rsa -pubout -in /tmp/jwt-private.pem -out /tmp/jwt-public.pem
+   ```
+
+   ```bash
+   awk 'NF {printf "%s\\n", $0}' /tmp/jwt-private.pem; echo; awk 'NF {printf "%s\\n", $0}' /tmp/jwt-public.pem; echo
+   ```
+
+2. **Render → New → Blueprint**, escolha o repositório. A Render lê o `render.yaml`, cria o Key Value e o web service e
+   pergunta os valores secretos: `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `JWT_PRIVATE_KEY`, `JWT_PUBLIC_KEY`,
+   `OPENROUTER_API_KEY` e `FRONTEND_URL` (se ainda não souber o endereço da Vercel, coloque
+   `https://placeholder.vercel.app` e ajuste depois no painel). Clique em **Apply**. O primeiro build leva alguns minutos.
+3. Quando o serviço estiver **Live**, copie o endereço (`https://compliance-api-xxxx.onrender.com`) e confira:
+   `GET /api/health` responde `200` e `GET /api/health/ready` responde `200` com `"redis":"ok","banco":"ok"`.
+4. **Vercel → Add New → Project**, repositório `compliance_ai`, **Root Directory = `frontend`**. Variáveis:
+   `NEXT_PUBLIC_API_URL=same-origin`, `BACKEND_URL=<endereço da Render, sem barra no final>` e
+   `NEXT_PUBLIC_TERMS_VERSION=1.1.0`. **Deploy.**
+5. De volta à Render, ajuste `FRONTEND_URL` para o endereço real da Vercel (não é usado no repasse, mas mantém a
+   configuração coerente).
+6. **Teste no navegador** (no endereço da Vercel): `/privacidade`; cadastro em `/register`; aceite em `/termos`; envio de
+   um PDF em `/upload`; resultado; e **recarregar a página** (precisa continuar logado, é a prova do cookie).
+
+**Se algo falhar**
+
+- **Build da Render falha:** abra os logs do build; o `rootDir`/`dockerfilePath` do `render.yaml` são os suspeitos.
+- **O Blueprint reclama do `fromService`:** crie o Key Value à mão (plano Free, `noeviction`), copie a URL **interna**
+  e cadastre `REDIS_URL` no web service.
+- **O serviço sobe e cai no boot:** leia os logs; a validação de produção lista o que falta (variável ausente, `REDIS_URL`
+  apontando para `localhost`...). Esperados: avisos de Redis sem TLS e sem senha, modelo `:free` e `allow`.
+- **A primeira requisição demora ou dá erro 504:** o serviço estava dormindo; espere cerca de 1 minuto e tente de novo.
+- **`/api/health/ready` responde `503`:** `redis` ou `banco` com `falhou`; confira o `REDIS_URL` e as chaves do Supabase.
+- **Rate limit juntando todos os usuários:** pode acontecer se o backend enxergar o IP da Vercel/Render; confira
+  `audit_logs.ip_address`.
+
+**Verificado:** o `render.yaml` é um YAML válido e a validação de produção do backend, com estas variáveis, dá **0 erros**
+(só os avisos acima). **Não verificado** (precisa da Render real): o Blueprint aplicando sem ajustes (em especial o
+`fromService` do Key Value), o backend conectando no Key Value pela rede privada a partir de um web service gratuito, o
+repasse da Vercel, e o comportamento do serviço dormindo (os workers e o agendamento só rodam enquanto ele está acordado).
+
 ### Validar em nuvem sem domínio (teste, NÃO feito)
 
 Para ver o app funcionando em nuvem **sem domínio próprio e sem conta no Cloudflare**, a Vercel faz o papel de
@@ -1688,10 +1747,12 @@ de login passariam sem criptografia nesse trecho) ou exige certificado na VM. O 
 
 **2. Supabase.** Confira se as migrations `001` a `004` rodaram e se o bucket `documents` está **privado**.
 
-**3. Redis Cloud.** Crie o banco gratuito e copie endereço, porta e senha para o formato
-`rediss://default:SENHA@HOST:PORTA` (TLS; se a conexão falhar, use `redis://` e confira no painel se o TLS está ligado).
-No painel, confirme que a política de memória é **`noeviction`** (o BullMQ exige e avisa no boot se não for).
-Depois do primeiro boot, confira `CLIENT LIST`: se passar de ~25 conexões, use 1 réplica.
+**3. Redis Cloud.** Crie o banco gratuito e copie endereço, porta e senha no formato `redis://default:SENHA@HOST:PORTA`.
+**Atenção: o plano gratuito do Redis Cloud não tem TLS** (segundo a documentação deles, só os planos pagos têm), então
+a senha e os dados da fila trafegariam sem criptografia pela internet. Para um teste é tolerável; para algo além disso,
+prefira o Redis na rede privada do próprio provedor (ver "Deploy direto na nuvem", que usa o Key Value da Render) ou um
+plano com TLS (`rediss://`). No painel, confirme que a política de memória é **`noeviction`** (o BullMQ exige e avisa no
+boot se não for). Depois do primeiro boot, confira `CLIENT LIST`: se passar de ~25 conexões, use 1 réplica.
 
 **4. Domínio e Cloudflare.** Registre o domínio e coloque o DNS dele no Cloudflare (Free).
 
@@ -1760,7 +1821,7 @@ ou WebSocket). Concorrência do worker, retenção de `audit_logs` e de `raw_res
 com carga real.
 
 **Não verificado** (só dá para provar na prática): o Tunnel entregando o IP do cliente ao Nginx (`LB_TRUSTED_CIDRS` com a
-faixa do Docker; vale conferir no passo 9), o `cloudflared` em execução, o Redis Cloud com este backend (TLS, política de
+faixa do Docker; vale conferir no passo 9), o `cloudflared` em execução, o Redis Cloud com este backend (sem TLS no plano gratuito, política de
 memória, contagem de conexões), o cookie `secure` e o login se mantendo por HTTPS, e se o tráfego do monitor evita a
 pausa do Supabase.
 

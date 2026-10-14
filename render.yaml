@@ -1,0 +1,84 @@
+# Render Blueprint — backend + Redis privado, no plano gratuito (sem VM, sem domínio, sem cartão).
+#
+#   Render → New → Blueprint → escolha este repositório. A Render lê este arquivo, pede os valores marcados
+#   com `sync: false` (segredos) e cria os dois serviços. O frontend fica na Vercel (ver README, "Deploy direto
+#   na nuvem"). O endereço da API será https://<nome>.onrender.com (HTTPS já incluso).
+#
+# Plano gratuito: 512 MB de RAM e 0,1 CPU; o serviço DORME após 15 min sem tráfego (a primeira requisição
+# depois disso leva cerca de 1 min); o Key Value (Redis) é só em memória e perde os dados ao reiniciar (a
+# varredura periódica reenfileira os documentos que ficaram sem análise). 750 horas gratuitas por mês.
+# Os limites mudam: confira em https://render.com/docs/free.
+#
+# Os dois serviços ficam na MESMA região (padrão, `oregon`): o Redis só é alcançável pela rede privada.
+
+services:
+  - type: keyvalue
+    name: compliance-redis
+    plan: free
+    # O BullMQ exige noeviction (senão pode perder jobs por eviction).
+    maxmemoryPolicy: noeviction
+    # Lista vazia = nenhuma conexão externa; só serviços da Render, pela rede privada.
+    ipAllowList: []
+
+  - type: web
+    name: compliance-api
+    runtime: docker
+    plan: free
+    rootDir: backend
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    healthCheckPath: /api/health
+    autoDeployTrigger: commit
+    envVars:
+      - key: NODE_ENV
+        value: production
+      # A Render injeta PORT; o backend já lê PORT.
+      - key: TRUST_PROXY
+        value: "true"
+      - key: ENABLE_DEBUG_ENDPOINT
+        value: "false"
+      - key: REDIS_URL
+        fromService:
+          type: keyvalue
+          name: compliance-redis
+          property: connectionString
+
+      # --- segredos: a Render pergunta na criação do Blueprint ---
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      # Par de chaves NOVO (README, seção 2), em UMA linha com \n literais.
+      - key: JWT_PRIVATE_KEY
+        sync: false
+      - key: JWT_PUBLIC_KEY
+        sync: false
+      - key: OPENROUTER_API_KEY
+        sync: false
+      # Endereço do frontend na Vercel (https://....vercel.app). Pode ser ajustado depois.
+      - key: FRONTEND_URL
+        sync: false
+
+      # --- configuração ---
+      - key: SUPABASE_STORAGE_BUCKET
+        value: documents
+      - key: JWT_ACCESS_EXPIRES_IN
+        value: 15m
+      - key: JWT_REFRESH_EXPIRES_IN
+        value: 7d
+      # Modelo gratuito: só funciona com `allow` (o provedor pode treinar com o conteúdo; o Termo de Uso avisa).
+      - key: OPENROUTER_MODEL
+        value: nvidia/nemotron-3-super-120b-a12b:free
+      - key: OPENROUTER_DATA_COLLECTION
+        value: allow
+      - key: OPENROUTER_MAX_TOKENS
+        value: "32000"
+      - key: OPENROUTER_TIMEOUT_MS
+        value: "180000"
+      - key: OPENROUTER_MAX_RETRIES
+        value: "2"
+      - key: TERMS_CURRENT_VERSION
+        value: 1.1.0
+      # 512 MB e 0,1 CPU: poucas análises ao mesmo tempo.
+      - key: ANALYSIS_CONCURRENCY
+        value: "2"
